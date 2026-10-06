@@ -1,0 +1,79 @@
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: ClusterRole
+metadata:
+  name: manager-role
+rules:
+- apiGroups:
+  - events.k8s.io
+  resources:
+  - events
+  verbs:
+  - create
+  - patch
+- apiGroups:
+  - gitops.example.io
+  resources:
+  - clustergitconfigs
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
+  - gitops.example.io
+  resources:
+  - gitresources
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+- apiGroups:
+  - gitops.example.io
+  resources:
+  - gitresources/finalizers
+  verbs:
+  - update
+- apiGroups:
+  - gitops.example.io
+  resources:
+  - gitresources/status
+  verbs:
+  - get
+  - patch
+  - update
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manager-role
+  namespace: argocd
+rules:
+- apiGroups:
+  - argoproj.io
+  resourceNames:
+  - git-resources
+  resources:
+  - applicationsets
+  verbs:
+  - get
+  - list
+  - patch
+  - update
+  - watch
+---
+apiVersion: rbac.authorization.k8s.io/v1
+kind: Role
+metadata:
+  name: manager-role
+  namespace: git-state-system
+rules:
+- apiGroups:
+  - ""
+  resources:
+  - secrets
+  verbs:
+  - get
+  - list
+  - watch

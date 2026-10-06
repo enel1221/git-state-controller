@@ -1,0 +1,11 @@
+# Whitelist source trees explicitly; Podman also needs their parent directories.
+**
+!cmd
+!cmd/**
+!api
+!api/**
+!internal
+!internal/**
+**/*_test.go
+!go.mod
+!go.sum

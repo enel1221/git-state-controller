@@ -1,0 +1,36 @@
+name: Full disposable-stack acceptance
+on:
+  push:
+  pull_request:
+permissions:
+  contents: read
+jobs:
+  acceptance:
+    runs-on: ubuntu-24.04
+    timeout-minutes: 45
+    steps:
+      - uses: actions/checkout@fbc6f3992d24b796d5a048ff273f7fcc4a7b6c09 # v5
+        with:
+          persist-credentials: false
+      - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
+        with:
+          go-version: 1.26.8
+      - name: Install pinned project-local tools
+        run: |
+          hack/install-ci-tools.sh
+          echo "$PWD/bin" >> "$GITHUB_PATH"
+      - run: make lint
+      - run: make up
+      - run: make test
+      - name: Collect diagnostics
+        if: failure()
+        run: make diagnostics
+      - uses: actions/upload-artifact@ea165f8d65b6e75b540449e92b4886f43607fa02 # v4
+        if: failure()
+        with:
+          name: stack-diagnostics
+          path: reports/
+          if-no-files-found: ignore
+      - name: Always remove disposable cluster
+        if: always()
+        run: make clean

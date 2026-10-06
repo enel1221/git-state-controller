@@ -1,0 +1,19 @@
+apiVersion: v1
+kind: Namespace
+metadata: {name: demo}
+---
+apiVersion: v1
+kind: Namespace
+metadata: {name: git-state-system}
+---
+apiVersion: argoproj.io/v1alpha1
+kind: AppProject
+metadata:
+  name: git-resources
+  namespace: argocd
+spec:
+  sourceRepos: ["http://forgejo.forgejo.svc.cluster.local:3000/demo/resources.git"]
+  destinations:
+    - {namespace: "*", server: "https://kubernetes.default.svc"}
+  namespaceResourceWhitelist:
+    - {group: "", kind: ConfigMap}

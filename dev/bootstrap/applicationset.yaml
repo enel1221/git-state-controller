@@ -1,0 +1,36 @@
+apiVersion: argoproj.io/v1alpha1
+kind: ApplicationSet
+metadata:
+  name: git-resources
+  namespace: argocd
+spec:
+  goTemplate: true
+  goTemplateOptions: [missingkey=error]
+  generators:
+    - list:
+        elements: []
+  syncPolicy:
+    applicationsSync: sync
+    preserveResourcesOnDeletion: false
+  template:
+    metadata:
+      name: '{{.applicationName}}'
+      labels:
+        gitops.example.io/managed: "true"
+      finalizers: [resources-finalizer.argocd.argoproj.io]
+    spec:
+      project: git-resources
+      source:
+        repoURL: '{{.repoURL}}'
+        targetRevision: '{{.revision}}'
+        path: '{{.directory}}'
+        directory:
+          recurse: false
+          include: '{{.filename}}'
+      destination:
+        server: https://kubernetes.default.svc
+        namespace: '{{.namespace}}'
+      syncPolicy:
+        automated:
+          prune: true
+          selfHeal: true

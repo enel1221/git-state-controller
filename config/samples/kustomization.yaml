@@ -1,0 +1,6 @@
+## Append samples of your project ##
+resources:
+- gitops_v1alpha1_gitresource.yaml
+- gitops_v1alpha1_gitresource_two.yaml
+- gitops_v1alpha1_clustergitconfig.yaml
+# +kubebuilder:scaffold:manifestskustomizesamples

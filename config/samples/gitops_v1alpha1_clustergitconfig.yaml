@@ -1,0 +1,11 @@
+apiVersion: gitops.example.io/v1alpha1
+kind: ClusterGitConfig
+metadata:
+  name: default
+spec:
+  credentials:
+    source: Secret
+    secretRef: {namespace: git-state-system, name: forgejo-writer}
+  commitAuthor:
+    name: git-state-controller
+    email: git-state-controller@example.invalid

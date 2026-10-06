@@ -1,0 +1,19 @@
+apiVersion: gitops.example.io/v1alpha1
+kind: GitResource
+metadata:
+  name: example-config-two
+  namespace: demo
+spec:
+  gitConfigRef: {kind: ClusterGitConfig, name: default}
+  repository:
+    url: http://forgejo.forgejo.svc.cluster.local:3000/demo/resources.git
+    branch: main
+    path: resources/demo/example-config-two/resource.yaml
+  manifest:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: example-config-two
+      namespace: demo
+    data:
+      greeting: second resource

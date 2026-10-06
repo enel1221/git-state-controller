@@ -1,0 +1,20 @@
+apiVersion: gitops.example.io/v1alpha1
+kind: GitResource
+metadata:
+  name: example-config
+  namespace: demo
+spec:
+  repository:
+    url: http://forgejo.forgejo.svc.cluster.local:3000/demo/resources.git
+    branch: main
+    path: resources/demo/example-config/resource.yaml
+  change:
+    message: Update example configuration
+  manifest:
+    apiVersion: v1
+    kind: ConfigMap
+    metadata:
+      name: example-config
+      namespace: demo
+    data:
+      greeting: hello
