@@ -8,8 +8,14 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/inelson/git-state-controller/internal/manifest"
+	"github.com/prometheus/client_golang/prometheus"
+	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/metrics"
 
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/config"
@@ -23,17 +29,40 @@ var ErrCredentialsInvalid = errors.New("git authentication or authorization fail
 
 var ErrRetry = errors.New("remote publication not confirmed; retry from current branch")
 
+var ErrPathAlreadyExists = errors.New("PathAlreadyExists: existing file is not owned by this GitResource; explicit adoption required")
+var ErrRecoveryRequired = errors.New("RecoveryRequired: cannot verify the last owned publication")
+var ErrPaused = errors.New("reconciliation paused")
+var gitDuration = prometheus.NewHistogramVec(prometheus.HistogramOpts{Name: "git_state_git_operation_seconds", Help: "Actual Git transport durations", Buckets: prometheus.DefBuckets}, []string{"operation", "outcome"})
+var rejectedPush = prometheus.NewCounter(prometheus.CounterOpts{Name: "git_state_rejected_push_retries_total", Help: "Pushes requiring refreshed branch retry"})
+
+func init() { metrics.Registry.MustRegister(gitDuration, rejectedPush) }
+
 type Operation struct {
-	URL, Branch, Path                string
-	Content                          []byte
-	Delete                           bool
-	Credentials                      Credentials
-	AuthorName, AuthorEmail, Message string
-	PreviousRevision                 string
+	OwnershipGuard                            func(context.Context, string, string, string) error
+	URL, Branch, Path                         string
+	Content                                   []byte
+	Delete                                    bool
+	Credentials                               Credentials
+	AuthorName, AuthorEmail, Message          string
+	PreviousRevision                          string
+	PreviousHash                              string
+	OwnerUID, SourceNamespace, SourceName     string
+	AllowAdopt, AllowLegacy, ReadOnly, Orphan bool
+	Guard                                     func(context.Context) error
+	Access                                    func(operation string, success bool)
+}
+type Recovery struct {
+	Revision   string
+	Content    []byte
+	Generation int64
 }
 type Result struct {
+	Recovery *Recovery
 	Revision string
 	Changed  bool
+	Hash     string
+	Missing  bool
+	Unowned  bool
 }
 
 type Publisher struct {
@@ -44,6 +73,20 @@ type Publisher struct {
 }
 
 func clone(ctx context.Context, op Operation) (*gogit.Repository, string, error) {
+	start := time.Now()
+	success := false
+	defer func() {
+		outcome := "failed"
+		if success {
+			outcome = "succeeded"
+		}
+		duration := time.Since(start).Seconds()
+		gitDuration.WithLabelValues("Fetch", outcome).Observe(duration)
+		ctrl.LoggerFrom(ctx).Info("Git operation", "operation", "Fetch", "outcome", outcome, "durationSeconds", duration)
+		if op.Access != nil {
+			op.Access("Fetch", success)
+		}
+	}()
 	dir, err := os.MkdirTemp("", "git-state-")
 	if err != nil {
 		return nil, "", fmt.Errorf("create temporary worktree: %w", err)
@@ -59,6 +102,7 @@ func clone(ctx context.Context, op Operation) (*gogit.Repository, string, error)
 		}
 		return nil, "", errors.New("clone failed; check repository, branch, credentials and connectivity")
 	}
+	success = true
 	return repo, dir, nil
 }
 
@@ -114,6 +158,22 @@ func revision(repo *gogit.Repository, op Operation, preserve bool) (string, erro
 			}
 		}
 	}
+	if preserve && op.OwnerUID != "" && !op.Delete {
+		iterator, e := repo.Log(&gogit.LogOptions{FileName: &op.Path})
+		if e == nil {
+			defer iterator.Close()
+			for {
+				commit, e := iterator.Next()
+				if e != nil {
+					break
+				}
+				content, e := fileAt(repo, commit.Hash.String(), op.Path)
+				if e == nil && bytes.Equal(content, op.Content) && strings.Contains(commit.Message, "\nGitResource-UID: "+op.OwnerUID+"\n") {
+					return commit.Hash.String(), nil
+				}
+			}
+		}
+	}
 	return head.Hash().String(), nil
 }
 
@@ -125,15 +185,71 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		return Result{}, err
 	}
 	defer os.RemoveAll(dir)
+	file, err := safeFile(dir, op.Path)
+	if err != nil {
+		return Result{}, err
+	}
+	content, readErr := os.ReadFile(file)
+	missing := os.IsNotExist(readErr)
+	if readErr != nil && !missing {
+		return Result{}, readErr
+	}
+	if op.ReadOnly {
+		return Result{Revision: op.PreviousRevision, Hash: manifest.Hash(content), Missing: missing}, nil
+	}
+	ownerNS, ownerName, owner, _ := manifest.Ownership(content)
+	if op.AllowAdopt && owner != "" && owner != op.OwnerUID && op.OwnershipGuard != nil {
+		if err := op.OwnershipGuard(ctx, ownerNS, ownerName, owner); err != nil {
+			return Result{}, err
+		}
+	}
+	legacy := false
+	if owner == "" && op.AllowLegacy && op.PreviousRevision != "" {
+		previous, e := fileAt(repo, op.PreviousRevision, op.Path)
+		legacy = e == nil && manifest.Hash(previous) == op.PreviousHash
+	}
+	if op.OwnerUID != "" && !missing && owner != op.OwnerUID && !legacy && !op.AllowAdopt {
+		if op.Orphan && op.PreviousRevision == "" {
+			return Result{Unowned: true}, nil
+		}
+		if op.Delete {
+			if owner != "" || op.PreviousRevision == "" {
+				return Result{Unowned: true}, nil
+			}
+			return Result{}, ErrRecoveryRequired
+		}
+		return Result{}, ErrPathAlreadyExists
+	}
+	var recovery *Recovery
+	if op.Orphan {
+		if missing && op.PreviousRevision == "" {
+			return Result{Unowned: true}, nil
+		}
+		published, recoveredSHA, generation, e := recoverPublished(repo, op)
+		if e != nil {
+			return Result{}, e
+		}
+		recovery = &Recovery{Revision: recoveredSHA, Content: published, Generation: generation}
+		op.Content, _, err = manifest.Orphan(published, op.SourceNamespace, op.SourceName, op.OwnerUID)
+		if err != nil {
+			return Result{}, err
+		}
+		op.Delete = false
+	}
+	if op.Guard != nil {
+		if err := op.Guard(ctx); err != nil {
+			return Result{}, err
+		}
+	}
 	equal, err := matches(dir, op)
 	if err != nil {
 		return Result{}, err
 	}
 	if equal {
 		sha, err := revision(repo, op, true)
-		return Result{Revision: sha}, err
+		return Result{Revision: sha, Hash: manifest.Hash(op.Content), Missing: op.Delete, Recovery: recovery}, err
 	}
-	file, err := safeFile(dir, op.Path)
+	file, err = safeFile(dir, op.Path)
 	if err != nil {
 		return Result{}, err
 	}
@@ -164,10 +280,27 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		p.BeforePush()
 	}
 	options := &gogit.PushOptions{RemoteName: "origin", Auth: &http.BasicAuth{Username: op.Credentials.Username, Password: op.Credentials.Password}, RefSpecs: []config.RefSpec{config.RefSpec("refs/heads/" + op.Branch + ":refs/heads/" + op.Branch)}}
+	if op.Guard != nil {
+		if err := op.Guard(ctx); err != nil {
+			return Result{}, err
+		}
+	}
+	start := time.Now()
+	var pushErr error
 	if p.Push != nil {
-		_ = p.Push(ctx, repo, options)
+		pushErr = p.Push(ctx, repo, options)
 	} else {
-		_ = repo.PushContext(ctx, options)
+		pushErr = repo.PushContext(ctx, options)
+	}
+	outcome := "succeeded"
+	if pushErr != nil {
+		outcome = "failed"
+	}
+	duration := time.Since(start).Seconds()
+	gitDuration.WithLabelValues("Push", outcome).Observe(duration)
+	ctrl.LoggerFrom(ctx).Info("Git operation", "operation", "Push", "outcome", outcome, "durationSeconds", duration)
+	if op.Access != nil {
+		op.Access("Push", pushErr == nil)
 	}
 	verified, verifyDir, err := clone(ctx, op)
 	if err != nil {
@@ -179,8 +312,78 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		return Result{}, err
 	}
 	if !equal {
+		if errors.Is(pushErr, transport.ErrAuthenticationRequired) || errors.Is(pushErr, transport.ErrAuthorizationFailed) {
+			return Result{}, ErrCredentialsInvalid
+		}
+		rejectedPush.Inc()
+		ctrl.LoggerFrom(ctx).Info("Git push requires retry")
 		return Result{}, ErrRetry
 	}
+	if op.Access != nil {
+		op.Access("Push", true)
+	}
 	sha, err := revision(verified, op, false)
-	return Result{Revision: sha, Changed: true}, err
+	return Result{Revision: sha, Changed: true, Hash: manifest.Hash(op.Content), Missing: op.Delete, Recovery: recovery}, err
+}
+
+func fileAt(repo *gogit.Repository, sha, path string) ([]byte, error) {
+	commit, err := repo.CommitObject(plumbing.NewHash(sha))
+	if err != nil {
+		return nil, err
+	}
+	file, err := commit.File(path)
+	if err != nil {
+		return nil, err
+	}
+	content, err := file.Contents()
+	return []byte(content), err
+}
+func commitGeneration(repo *gogit.Repository, sha string) int64 {
+	commit, err := repo.CommitObject(plumbing.NewHash(sha))
+	if err != nil {
+		return 0
+	}
+	for _, line := range strings.Split(commit.Message, "\n") {
+		if strings.HasPrefix(line, "GitResource-Generation: ") {
+			n, _ := strconv.ParseInt(strings.TrimPrefix(line, "GitResource-Generation: "), 10, 64)
+			return n
+		}
+	}
+	return 0
+}
+func recoverPublished(repo *gogit.Repository, op Operation) ([]byte, string, int64, error) {
+	if op.PreviousRevision != "" {
+		content, err := fileAt(repo, op.PreviousRevision, op.Path)
+		if err == nil {
+			ns, name, uid, _ := manifest.Ownership(content)
+			if uid == op.OwnerUID && ns == op.SourceNamespace && name == op.SourceName || uid == "" && op.AllowLegacy && manifest.Hash(content) == op.PreviousHash {
+				return content, op.PreviousRevision, commitGeneration(repo, op.PreviousRevision), nil
+			}
+		}
+		return nil, "", 0, ErrRecoveryRequired
+	}
+	// Narrow path-scoped recovery of this UID's verified publication after a lost status write.
+	iterator, err := repo.Log(&gogit.LogOptions{FileName: &op.Path})
+	if err != nil {
+		return nil, "", 0, ErrRecoveryRequired
+	}
+	defer iterator.Close()
+	for {
+		commit, err := iterator.Next()
+		if err != nil {
+			break
+		}
+		if !strings.Contains(commit.Message, "\nGitResource-UID: "+op.OwnerUID+"\n") {
+			continue
+		}
+		content, err := fileAt(repo, commit.Hash.String(), op.Path)
+		if err != nil {
+			continue
+		}
+		ns, name, uid, _ := manifest.Ownership(content)
+		if uid == op.OwnerUID && ns == op.SourceNamespace && name == op.SourceName {
+			return content, commit.Hash.String(), commitGeneration(repo, commit.Hash.String()), nil
+		}
+	}
+	return nil, "", 0, ErrRecoveryRequired
 }

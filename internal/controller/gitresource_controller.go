@@ -2,22 +2,23 @@ package controller
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"math/rand/v2"
-	"reflect"
 	"time"
 
 	api "github.com/inelson/git-state-controller/api/v1alpha1"
 	gitwriter "github.com/inelson/git-state-controller/internal/git"
 	"github.com/inelson/git-state-controller/internal/manifest"
 	corev1 "k8s.io/api/core/v1"
+	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/events"
-	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	runtimecontroller "sigs.k8s.io/controller-runtime/pkg/controller"
 	"sigs.k8s.io/controller-runtime/pkg/controller/controllerutil"
@@ -36,12 +37,14 @@ type GitResourceReconciler struct {
 	AllowHTTP        bool
 	Workers          int
 	OperationTimeout time.Duration
+	SetKey           types.NamespacedName
 }
 
 // +kubebuilder:rbac:groups=gitops.example.io,resources=gitresources,verbs=get;list;watch;update;patch
 // +kubebuilder:rbac:groups=gitops.example.io,resources=gitresources/status,verbs=get;update;patch
 // +kubebuilder:rbac:groups=gitops.example.io,resources=gitresources/finalizers,verbs=update
 // +kubebuilder:rbac:groups=gitops.example.io,resources=clustergitconfigs,verbs=get;list;watch
+// +kubebuilder:rbac:groups=gitops.example.io,resources=clustergitconfigs/status,verbs=get;patch;update
 // +kubebuilder:rbac:groups="",resources=secrets,verbs=get;list;watch,namespace=git-state-system
 // +kubebuilder:rbac:groups=events.k8s.io,resources=events,verbs=create;patch
 
@@ -54,42 +57,54 @@ func ConfigName(cr *api.GitResource) string {
 
 func (r *GitResourceReconciler) resolve(ctx context.Context, cr *api.GitResource) (gitwriter.Operation, string, error) {
 	op := gitwriter.Operation{URL: cr.Spec.Repository.URL, Branch: cr.Spec.Repository.Branch, Path: cr.Spec.Repository.Path,
-		Delete: !cr.DeletionTimestamp.IsZero(), PreviousRevision: cr.Status.LastPublishedRevision}
-	if (cr.Spec.GitConfigRef.Kind != "" && cr.Spec.GitConfigRef.Kind != "ClusterGitConfig") || (cr.Spec.DeletionPolicy != "" && cr.Spec.DeletionPolicy != "Delete") {
+		Delete: !cr.DeletionTimestamp.IsZero(), PreviousRevision: cr.Status.LastPublishedRevision,
+		PreviousHash: cr.Status.LastPublishedContentHash, OwnerUID: string(cr.UID), SourceNamespace: cr.Namespace, SourceName: cr.Name, AllowAdopt: adopting(cr)}
+	if cr.Status.Cleanup != nil && cr.Status.Cleanup.Policy == "Orphan" && op.Delete {
+		op.Orphan = true
+		op.Delete = false
+		if cr.Status.Cleanup.Revision != "" {
+			op.PreviousRevision = cr.Status.Cleanup.Revision
+		}
+	}
+	if (cr.Spec.GitConfigRef.Kind != "" && cr.Spec.GitConfigRef.Kind != "ClusterGitConfig") || (cr.Spec.DeletionPolicy != "" && cr.Spec.DeletionPolicy != "Delete" && cr.Spec.DeletionPolicy != "Orphan") {
 		return op, "InvalidSpec", errors.New("unsupported configuration kind or deletion policy")
 	}
 	if err := gitwriter.ValidateDestination(op.URL, op.Branch, op.Path, r.AllowHTTP); err != nil {
 		return op, "InvalidSpec", err
 	}
-	if !op.Delete {
+	if !op.Delete && !op.Orphan {
 		var err error
-		op.Content, _, err = manifest.Render(cr.Spec.Manifest.Raw)
+		op.Content, _, err = manifest.RenderManaged(cr.Spec.Manifest.Raw, cr.Namespace, cr.Name, string(cr.UID), "managed")
 		if err != nil {
 			return op, "InvalidSpec", err
 		}
 	}
-	config := &api.ClusterGitConfig{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Name: ConfigName(cr)}, config); err != nil {
-		return op, "ConfigNotFound", errors.New("cannot read ClusterGitConfig")
-	}
-	creds := config.Spec.Credentials
-	if creds.Source != "Secret" || creds.SecretRef.Namespace != r.Namespace {
-		return op, "CredentialsInvalid", errors.New("credentials must reference a Secret in the controller namespace")
-	}
-	secret := &corev1.Secret{}
-	if err := r.Reader.Get(ctx, types.NamespacedName{Namespace: r.Namespace, Name: creds.SecretRef.Name}, secret); err != nil {
-		return op, "CredentialsInvalid", errors.New("cannot read credentials Secret")
+	config, secret, reason, err := r.loadConfig(ctx, ConfigName(cr))
+	if err != nil {
+		return op, reason, err
 	}
 	op.Credentials = gitwriter.Credentials{Username: string(secret.Data["username"]), Password: string(secret.Data["password"])}
-	if op.Credentials.Username == "" || op.Credentials.Password == "" {
-		return op, "CredentialsInvalid", errors.New("credentials require nonempty username and password")
-	}
 	op.AuthorName, op.AuthorEmail = config.Spec.CommitAuthor.Name, config.Spec.CommitAuthor.Email
 	if op.AuthorName == "" {
 		op.AuthorName = "git-state-controller"
 	}
 	if op.AuthorEmail == "" {
 		op.AuthorEmail = "git-state-controller@example.invalid"
+	}
+	var evidence *api.GitAccessObservation
+	op.Access = func(operation string, success bool) {
+		if evidence != nil && evidence.Operation == "Push" && operation == "Fetch" {
+			return
+		}
+		why, msg := "Succeeded", ""
+		if !success {
+			why = "AccessFailed"
+			msg = "Git access failed; check repository permissions and connectivity."
+		}
+		evidence = &api.GitAccessObservation{RepositoryURL: op.URL, Operation: operation, Success: success, Reason: why, Message: msg, ConfigGeneration: config.Generation, SecretUID: string(secret.UID), SecretResourceVersion: secret.ResourceVersion, LastUpdatedAt: metav1.Now()}
+		evidenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
+		defer cancel()
+		r.recordConfig(evidenceCtx, config, secret, true, "CredentialsLoaded", evidence)
 	}
 	action := "Publish"
 	if op.Delete {
@@ -117,11 +132,11 @@ func (r *GitResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	uid := cr.UID
 	if cr.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(cr, Finalizer) {
+		before := cr.DeepCopy()
 		controllerutil.AddFinalizer(cr, Finalizer)
-		if err := r.Update(ctx, cr); err != nil {
+		if err := r.Patch(ctx, cr, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{})); err != nil {
 			return ctrl.Result{}, err
 		}
-		// Start from an API read after persisting the finalizer, before making Git state.
 		if err := r.Reader.Get(ctx, req.NamespacedName, cr); err != nil {
 			return ctrl.Result{}, client.IgnoreNotFound(err)
 		}
@@ -131,6 +146,34 @@ func (r *GitResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	if !cr.DeletionTimestamp.IsZero() && !controllerutil.ContainsFinalizer(cr, Finalizer) {
 		return ctrl.Result{}, nil
+	}
+	if paused(cr) {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(*api.GitResource) {})
+	}
+	if !cr.DeletionTimestamp.IsZero() && cr.Status.Cleanup == nil {
+
+		if err := patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+			if current.Status.Cleanup == nil && !paused(current) {
+				policy := current.Spec.DeletionPolicy
+				if policy == "" {
+					policy = "Delete"
+				}
+				current.Status.Cleanup = &api.CleanupCheckpoint{Policy: policy}
+			}
+		}); err != nil {
+			return ctrl.Result{}, err
+		}
+		if err := r.Reader.Get(ctx, req.NamespacedName, cr); err != nil {
+			return ctrl.Result{}, client.IgnoreNotFound(err)
+		}
+	}
+	// A durable cleanup checkpoint proves the Git effect already completed.
+	// Retrying the API handoff must not repair later branch edits or change its pin.
+	if !cr.DeletionTimestamp.IsZero() && cr.Status.Cleanup != nil && cr.Status.Cleanup.Revision != "" {
+		if cr.Status.Cleanup.Policy == "Orphan" && !r.handoffVerified(ctx, cr, cr.Status.Cleanup.Revision, "orphaned") {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
+		return ctrl.Result{}, r.releaseFinalizer(ctx, cr)
 	}
 	var result gitwriter.Result
 	var op gitwriter.Operation
@@ -148,74 +191,192 @@ attempts:
 			case <-timer.C:
 			}
 			if err = r.Reader.Get(ctx, req.NamespacedName, cr); err != nil {
-				if ctx.Err() != nil {
-					break
-				}
-				return ctrl.Result{}, client.IgnoreNotFound(err)
+				break
 			}
 			if cr.UID != uid {
 				return ctrl.Result{}, nil
 			}
 		}
+		if paused(cr) {
+			err = gitwriter.ErrPaused
+			break
+		}
 		op, reason, err = r.resolve(ctx, cr)
 		if err != nil {
 			break
+		}
+		ref, legacy, identityErr := r.publicationIdentity(ctx, cr)
+		if identityErr != nil {
+			err = identityErr
+			reason = "AdoptionBlocked"
+			if errors.Is(identityErr, gitwriter.ErrPathAlreadyExists) {
+				reason = "PathAlreadyExists"
+			}
+			break
+		}
+		op.AllowLegacy = legacy
+		op.OwnershipGuard = func(checkCtx context.Context, namespace, name, ownerUID string) error {
+			old := &api.GitResource{}
+			e := r.Reader.Get(checkCtx, types.NamespacedName{Namespace: namespace, Name: name}, old)
+			if e == nil && string(old.UID) == ownerUID {
+				return errors.New("old GitResource owner still exists; adoption blocked")
+			}
+			if e != nil && !apierrors.IsNotFound(e) {
+				return errors.New("cannot verify old owner absence")
+			}
+			return nil
+		}
+		if cr.Status.ApplicationRef == nil || *cr.Status.ApplicationRef != ref {
+			if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+				if current.Generation == cr.Generation && !paused(current) {
+					current.Status.ApplicationRef = &ref
+				}
+			}); err != nil {
+				break
+			}
+			cr.Status.ApplicationRef = &ref
+		}
+		if !op.Delete && !op.Orphan && !op.AllowAdopt && cr.Status.LastPublishedRevision != "" {
+			desired := manifest.Hash(op.Content)
+			if desired == cr.Status.LastPublishedContentHash {
+				op.ReadOnly = true
+			} else if legacy {
+				_, oldHash, e := manifest.Render(cr.Spec.Manifest.Raw)
+				if e == nil && oldHash == cr.Status.LastPublishedContentHash {
+					op.ReadOnly = true
+				}
+			}
+		}
+		processed := cr.DeepCopy()
+		op.Guard = func(guardCtx context.Context) error {
+			current := &api.GitResource{}
+			if e := r.Reader.Get(guardCtx, req.NamespacedName, current); e != nil {
+				return e
+			}
+			if current.UID != uid || !current.DeletionTimestamp.Equal(processed.DeletionTimestamp) {
+				return gitwriter.ErrRetry
+			}
+			if paused(current) {
+				return gitwriter.ErrPaused
+			}
+			if adopting(current) {
+				_, _, e := r.publicationIdentity(guardCtx, current)
+				return e
+			}
+			return nil
 		}
 		result, err = r.Publisher.Attempt(ctx, op)
 		if !errors.Is(err, gitwriter.ErrRetry) {
 			break
 		}
 	}
-	// The Git deadline must not prevent reporting a timeout through Kubernetes.
-	// Keep this API work bounded and tied to manager shutdown independently.
 	ctx, statusCancel := context.WithTimeout(requestCtx, 30*time.Second)
 	defer statusCancel()
+	if errors.Is(err, gitwriter.ErrPaused) {
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(*api.GitResource) {})
+	}
 	if err != nil {
+		if cr.DeletionTimestamp.IsZero() && cr.Status.LastPublishedRevision != "" && (op.ReadOnly || len(op.Content) > 0 && manifest.Hash(op.Content) == cr.Status.LastPublishedContentHash) {
+			if statusErr := r.setStatus(ctx, cr, true, "Unchanged", "Desired manifest publication verified in Git.", gitwriter.Result{Revision: cr.Status.LastPublishedRevision}, cr.Status.LastPublishedContentHash); statusErr != nil {
+				return ctrl.Result{}, statusErr
+			}
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+				if current.Generation == cr.Generation {
+					condition(current, "GitDrift", metav1.ConditionUnknown, "AccessFailed", "Cannot compare the managed file with the published content.")
+				}
+			})
+		}
 		if reason == "" {
 			reason = "PublishFailed"
 			if errors.Is(err, gitwriter.ErrCredentialsInvalid) {
 				reason = "CredentialsInvalid"
 			}
+			if errors.Is(err, gitwriter.ErrPathAlreadyExists) {
+				reason = "PathAlreadyExists"
+			}
+			if errors.Is(err, gitwriter.ErrRecoveryRequired) {
+				reason = "RecoveryRequired"
+			}
 		}
 		if !cr.DeletionTimestamp.IsZero() {
 			reason = "DeleteFailed"
 		}
-		// Transport diagnostics are intentionally generic and contain no credentials.
-		if r.Recorder != nil {
-			r.Recorder.Eventf(cr, nil, corev1.EventTypeWarning, reason, "Publish", "%s", err.Error())
-		}
-		if statusErr := r.setStatus(ctx, cr, false, reason, err.Error(), gitwriter.Result{}, ""); statusErr != nil {
+		statusErr := r.setStatus(ctx, cr, false, reason, err.Error(), gitwriter.Result{}, "")
+		if statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		return ctrl.Result{}, err
-	}
-	if op.Delete {
-		err = retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-			current := &api.GitResource{}
-			if err := r.Reader.Get(ctx, req.NamespacedName, current); err != nil {
-				return client.IgnoreNotFound(err)
+		_ = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+			if current.Generation == cr.Generation && current.DeletionTimestamp.IsZero() && current.Status.LastPublishedRevision != "" {
+				condition(current, "GitDrift", metav1.ConditionUnknown, "AccessFailed", "Cannot compare the managed file with the published content.")
 			}
-			if current.UID != uid {
-				return nil
-			}
-			controllerutil.RemoveFinalizer(current, Finalizer)
-			return r.Update(ctx, current)
 		})
-		if err == nil {
-			ctrl.LoggerFrom(ctx).Info("Removed Git file and released finalizer", "resource", req.NamespacedName, "generation", cr.Generation)
-		}
 		return ctrl.Result{}, err
 	}
-	_, hash, err := manifest.Render(cr.Spec.Manifest.Raw)
-	if err != nil {
-		return ctrl.Result{}, err
+	if !cr.DeletionTimestamp.IsZero() {
+		if !result.Unowned {
+			if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+				if current.Status.Cleanup != nil {
+					current.Status.Cleanup.Revision = result.Revision
+					if current.Status.LastPublishedRevision == "" && result.Recovery != nil {
+						current.Status.LastPublishedRevision = result.Recovery.Revision
+						current.Status.LastPublishedGeneration = result.Recovery.Generation
+						current.Status.LastPublishedContentHash = manifest.Hash(result.Recovery.Content)
+						object, e := manifest.Decode(result.Recovery.Content)
+						if e == nil {
+							raw, _ := json.Marshal(object)
+							current.Status.PublishedResourceRef = resourceReference(raw)
+						}
+					}
+				}
+			}); err != nil {
+				return ctrl.Result{}, err
+			}
+			cr.Status.Cleanup.Revision = result.Revision
+			if e := r.Reader.Get(ctx, req.NamespacedName, cr); e != nil {
+				return ctrl.Result{}, client.IgnoreNotFound(e)
+			}
+		}
+		if op.Orphan && !result.Unowned {
+			if !r.handoffVerified(ctx, cr, result.Revision, "orphaned") {
+				return ctrl.Result{RequeueAfter: time.Second}, nil
+			}
+		}
+		return ctrl.Result{}, r.releaseFinalizer(ctx, cr)
+	}
+	hash := manifest.Hash(op.Content)
+	if op.ReadOnly {
+		hash = cr.Status.LastPublishedContentHash
 	}
 	reason = "Unchanged"
 	if result.Changed {
 		reason = "Pushed"
 	}
-	if err = r.setStatus(ctx, cr, true, reason, "Desired manifest is present in the remote repository.", result, hash); err != nil {
+	if err = r.setStatus(ctx, cr, true, reason, "Desired manifest publication verified in Git.", result, hash); err != nil {
 		return ctrl.Result{}, err
+	}
+	if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+		if current.Generation != cr.Generation || current.Status.LastPublishedRevision != result.Revision {
+			return
+		}
+		status, why, msg := metav1.ConditionFalse, "InSync", "Managed file matches the last published content."
+		if result.Missing {
+			status, why, msg = metav1.ConditionTrue, "FileMissing", "Managed file is absent at branch HEAD."
+		} else if result.Hash != hash {
+			status, why, msg = metav1.ConditionTrue, "ExternalModification", "Branch HEAD differs from the last published content."
+		}
+		condition(current, "GitDrift", status, why, msg)
+	}); err != nil {
+		return ctrl.Result{}, err
+	}
+	if adopting(cr) {
+		cr.Status.LastPublishedRevision = result.Revision
+		if r.handoffVerified(ctx, cr, result.Revision, "managed") {
+			if err = r.consumeAdoption(ctx, cr); err != nil {
+				return ctrl.Result{}, err
+			}
+		} else {
+			return ctrl.Result{RequeueAfter: time.Second}, nil
+		}
 	}
 	if result.Changed {
 		ctrl.LoggerFrom(ctx).Info("Published GitResource", "resource", req.NamespacedName, "generation", cr.Generation, "revision", result.Revision)
@@ -223,17 +384,12 @@ attempts:
 	return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 }
 
-// A status conflict never repeats Git work. The UID and processed generation travel together.
+// Publication and observer writers merge only their fields against the latest API object.
 func (r *GitResourceReconciler) setStatus(ctx context.Context, processed *api.GitResource, published bool, reason, message string, result gitwriter.Result, hash string) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := &api.GitResource{}
-		if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(processed), current); err != nil {
-			return client.IgnoreNotFound(err)
+	return patchStatus(ctx, r.Client, r.Reader, processed, func(current *api.GitResource) {
+		if current.Status.ObservedGeneration > processed.Generation || current.Status.LastPublishedGeneration > processed.Generation {
+			return
 		}
-		if current.UID != processed.UID || current.Status.ObservedGeneration > processed.Generation {
-			return nil
-		}
-		before := current.Status.DeepCopy()
 		current.Status.ObservedGeneration = processed.Generation
 		status := metav1.ConditionFalse
 		if published {
@@ -241,18 +397,29 @@ func (r *GitResourceReconciler) setStatus(ctx context.Context, processed *api.Gi
 			current.Status.LastPublishedGeneration = processed.Generation
 			current.Status.LastPublishedRevision = result.Revision
 			current.Status.LastPublishedContentHash = hash
+			current.Status.PublishedResourceRef = resourceReference(processed.Spec.Manifest.Raw)
 		}
-		// Preserve a successful reason on periodic no-ops so status does not churn Pushed -> Unchanged.
 		previous := meta.FindStatusCondition(current.Status.Conditions, "Published")
+		why := reason
 		if published && !result.Changed && previous != nil && previous.Status == metav1.ConditionTrue && previous.ObservedGeneration == processed.Generation {
-			reason = previous.Reason
+			why = previous.Reason
 		}
-		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "Published", Status: status, ObservedGeneration: processed.Generation, Reason: reason, Message: message})
-		if reflect.DeepEqual(before, &current.Status) {
-			return nil
-		}
-		return r.Status().Update(ctx, current)
+		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "Published", Status: status, Reason: why, Message: bounded(message), ObservedGeneration: processed.Generation})
 	})
+}
+func resourceReference(raw []byte) *api.ResourceReference {
+	var obj struct {
+		APIVersion string `json:"apiVersion"`
+		Kind       string `json:"kind"`
+		Metadata   struct {
+			Name      string `json:"name"`
+			Namespace string `json:"namespace"`
+		} `json:"metadata"`
+	}
+	if json.Unmarshal(raw, &obj) != nil {
+		return nil
+	}
+	return &api.ResourceReference{APIVersion: obj.APIVersion, Kind: obj.Kind, Name: obj.Metadata.Name, Namespace: obj.Metadata.Namespace}
 }
 
 func (r *GitResourceReconciler) affected(ctx context.Context, changed client.Object) []reconcile.Request {
@@ -295,8 +462,8 @@ func (r *GitResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 	if r.Workers == 0 {
 		r.Workers = 4
 	}
-	return ctrl.NewControllerManagedBy(mgr).For(&api.GitResource{}).
-		Watches(&api.ClusterGitConfig{}, handler.EnqueueRequestsFromMapFunc(r.affected)).
+	return ctrl.NewControllerManagedBy(mgr).For(&api.GitResource{}, builder.WithPredicates(publisherPredicate)).
+		Watches(&api.ClusterGitConfig{}, handler.EnqueueRequestsFromMapFunc(r.affected), builder.WithPredicates(configPredicate)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.affected)).
 		WithOptions(runtimecontroller.Options{MaxConcurrentReconciles: r.Workers}).Complete(r)
 }

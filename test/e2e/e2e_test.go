@@ -20,6 +20,7 @@ import (
 	gogit "github.com/go-git/go-git/v5"
 	"github.com/go-git/go-git/v5/plumbing"
 	"github.com/go-git/go-git/v5/plumbing/transport/http"
+	"github.com/go-logr/logr"
 	api "github.com/inelson/git-state-controller/api/v1alpha1"
 	"github.com/inelson/git-state-controller/internal/controller"
 	"github.com/inelson/git-state-controller/internal/manifest"
@@ -34,6 +35,7 @@ import (
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/tools/clientcmd"
 	"k8s.io/client-go/util/retry"
+	ctrl "sigs.k8s.io/controller-runtime"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
 
@@ -41,9 +43,11 @@ type stack struct {
 	client.Client
 	root, namespace, repoURL string
 	auth                     *http.BasicAuth
+	watcher                  client.WithWatch
 }
 
 func newStack(t *testing.T) *stack {
+	ctrl.SetLogger(logr.Discard())
 	t.Helper()
 	root, err := filepath.Abs("../..")
 	if err != nil {
@@ -84,7 +88,13 @@ func newStack(t *testing.T) *stack {
 	_ = corev1.AddToScheme(scheme)
 	_ = appsv1.AddToScheme(scheme)
 	_ = rbacv1.AddToScheme(scheme)
-	c, err := client.New(cfg, client.Options{Scheme: scheme})
+	c, err := client.NewWithWatch(cfg, client.Options{Scheme: scheme})
+	if err != nil {
+		t.Fatal(err)
+	}
+	watchConfig := *cfg
+	watchConfig.Timeout = 0
+	watcher, err := client.NewWithWatch(&watchConfig, client.Options{Scheme: scheme})
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -100,7 +110,7 @@ func newStack(t *testing.T) *stack {
 	if err != nil {
 		t.Fatal(err)
 	}
-	s := &stack{Client: c, root: root, namespace: fmt.Sprintf("git-e2e-%d", time.Now().UnixNano()), repoURL: "http://127.0.0.1:" + strings.TrimSpace(string(port)) + "/demo/resources.git", auth: &http.BasicAuth{Username: creds.Username, Password: creds.Password}}
+	s := &stack{Client: c, root: root, namespace: fmt.Sprintf("git-e2e-%d", time.Now().UnixNano()), repoURL: "http://127.0.0.1:" + strings.TrimSpace(string(port)) + "/demo/resources.git", auth: &http.BasicAuth{Username: creds.Username, Password: creds.Password}, watcher: watcher}
 	if err = c.Create(context.Background(), &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: s.namespace}}); err != nil {
 		t.Fatal(err)
 	}
@@ -181,8 +191,9 @@ func (s *stack) edit(t *testing.T, cr *api.GitResource, fn func(*api.GitResource
 		if err := s.Get(context.Background(), client.ObjectKeyFromObject(cr), fresh); err != nil {
 			return err
 		}
+		before := fresh.DeepCopy()
 		fn(fresh)
-		return s.Update(context.Background(), fresh)
+		return s.Patch(context.Background(), fresh, client.MergeFrom(before))
 	}); err != nil {
 		t.Fatal(err)
 	}
@@ -197,9 +208,20 @@ func (s *stack) clone(t *testing.T) *gogit.Repository {
 	t.Helper()
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
 	defer cancel()
-	r, err := gogit.PlainCloneContext(ctx, t.TempDir(), false, &gogit.CloneOptions{URL: s.repoURL, ReferenceName: plumbing.NewBranchReferenceName("main"), SingleBranch: true, Auth: s.auth})
-	if err != nil {
-		t.Fatal("Cannot clone live fixture repository")
+	var r *gogit.Repository
+	for {
+		var err error
+		r, err = gogit.PlainCloneContext(ctx, t.TempDir(), false, &gogit.CloneOptions{URL: s.repoURL, ReferenceName: plumbing.NewBranchReferenceName("main"), SingleBranch: true, Auth: s.auth})
+		if err == nil {
+			break
+		}
+		timer := time.NewTimer(250 * time.Millisecond)
+		select {
+		case <-ctx.Done():
+			timer.Stop()
+			t.Fatal("Cannot clone live fixture repository within recovery deadline")
+		case <-timer.C:
+		}
 	}
 	return r
 }
@@ -219,7 +241,7 @@ func (s *stack) assertFile(t *testing.T, cr *api.GitResource) {
 	t.Helper()
 	repo := s.clone(t)
 	head, _ := repo.Head()
-	want, _, err := manifest.Render(cr.Spec.Manifest.Raw)
+	want, _, err := manifest.RenderManaged(cr.Spec.Manifest.Raw, cr.Namespace, cr.Name, string(cr.UID), "managed")
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -370,28 +392,7 @@ func TestManagedStack(t *testing.T) {
 			return s.Patch(ctx, app, client.MergeFrom(before)) == nil
 		})
 	})
-	t.Run("twenty-concurrent-publications", func(t *testing.T) {
-		crs := []*api.GitResource{}
-		for i := 0; i < 20; i++ {
-			crs = append(crs, s.create(t, fmt.Sprintf("concurrent-%02d", i)))
-		}
-		for i, cr := range crs {
-			crs[i] = s.published(t, cr)
-		}
-		repo := s.clone(t)
-		head, _ := repo.Head()
-		for _, cr := range crs {
-			want, _, _ := manifest.Render(cr.Spec.Manifest.Raw)
-			got, err := fileAt(repo, head.Hash().String(), cr.Spec.Repository.Path)
-			if err != nil || !bytes.Equal(got, want) {
-				t.Fatal("concurrent file lost", cr.Name)
-			}
-			s.application(t, cr)
-		}
-		if _, err := fileAt(repo, head.Hash().String(), "README.md"); err != nil {
-			t.Fatal("unrelated repository content lost")
-		}
-	})
+	t.Run("twenty-concurrent-publications", func(t *testing.T) { s.measureTwenty(t) })
 	t.Run("alternate-configuration-failure-and-recovery", func(t *testing.T) {
 		name := s.namespace
 		secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Name: name, Namespace: "git-state-system"}, Data: map[string][]byte{"username": []byte(s.auth.Username), "password": []byte("wrong")}}

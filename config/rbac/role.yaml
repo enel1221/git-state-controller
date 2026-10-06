@@ -5,6 +5,12 @@ metadata:
   name: manager-role
 rules:
 - apiGroups:
+  - ""
+  resources:
+  - configmaps
+  verbs:
+  - get
+- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -22,6 +28,15 @@ rules:
 - apiGroups:
   - gitops.example.io
   resources:
+  - clustergitconfigs/status
+  - gitresources/status
+  verbs:
+  - get
+  - patch
+  - update
+- apiGroups:
+  - gitops.example.io
+  resources:
   - gitresources
   verbs:
   - get
@@ -36,13 +51,11 @@ rules:
   verbs:
   - update
 - apiGroups:
-  - gitops.example.io
+  - testing.gitops.example.io
   resources:
-  - gitresources/status
+  - statusobjects
   verbs:
   - get
-  - patch
-  - update
 ---
 apiVersion: rbac.authorization.k8s.io/v1
 kind: Role
@@ -50,6 +63,14 @@ metadata:
   name: manager-role
   namespace: argocd
 rules:
+- apiGroups:
+  - argoproj.io
+  resources:
+  - applications
+  verbs:
+  - get
+  - list
+  - watch
 - apiGroups:
   - argoproj.io
   resourceNames:

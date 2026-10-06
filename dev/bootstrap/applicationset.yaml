@@ -17,6 +17,11 @@ spec:
       name: '{{.applicationName}}'
       labels:
         gitops.example.io/managed: "true"
+      annotations:
+        gitops.example.io/source: '{{.namespace}}/{{.name}}'
+        gitops.example.io/source-uid: '{{.uid}}'
+        gitops.example.io/applicationset: argocd/git-resources
+        gitops.example.io/management-state: '{{ default "managed" (index . "managementState") }}'
       finalizers: [resources-finalizer.argocd.argoproj.io]
     spec:
       project: git-resources

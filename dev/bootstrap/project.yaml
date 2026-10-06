@@ -17,3 +17,4 @@ spec:
     - {namespace: "*", server: "https://kubernetes.default.svc"}
   namespaceResourceWhitelist:
     - {group: "", kind: ConfigMap}
+    - {group: testing.gitops.example.io, kind: StatusObject}

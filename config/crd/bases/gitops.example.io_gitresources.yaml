@@ -15,6 +15,9 @@ spec:
   scope: Namespaced
   versions:
   - additionalPrinterColumns:
+    - jsonPath: .status.conditions[?(@.type=="Ready")].status
+      name: Ready
+      type: string
     - jsonPath: .status.conditions[?(@.type=="Published")].status
       name: Published
       type: string
@@ -57,6 +60,7 @@ spec:
                 default: Delete
                 enum:
                 - Delete
+                - Orphan
                 type: string
               gitConfigRef:
                 default:
@@ -117,6 +121,64 @@ spec:
             type: object
           status:
             properties:
+              applicationRef:
+                properties:
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                required:
+                - name
+                - namespace
+                type: object
+              argoCD:
+                properties:
+                  deletionTimestamp:
+                    format: date-time
+                    type: string
+                  destination:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  generation:
+                    format: int64
+                    type: integer
+                  lastUpdatedAt:
+                    format: date-time
+                    type: string
+                  observation:
+                    properties:
+                      message:
+                        type: string
+                      reason:
+                        type: string
+                    required:
+                    - reason
+                    type: object
+                  resourceVersion:
+                    type: string
+                  source:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  status:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                  uid:
+                    type: string
+                required:
+                - observation
+                type: object
+              cleanup:
+                properties:
+                  policy:
+                    enum:
+                    - Delete
+                    - Orphan
+                    type: string
+                  revision:
+                    type: string
+                required:
+                - policy
+                type: object
               conditions:
                 items:
                   description: Condition contains details for one aspect of the current
@@ -188,6 +250,73 @@ spec:
               observedGeneration:
                 format: int64
                 type: integer
+              publishedResourceRef:
+                properties:
+                  apiVersion:
+                    type: string
+                  kind:
+                    type: string
+                  name:
+                    type: string
+                  namespace:
+                    type: string
+                  uid:
+                    type: string
+                required:
+                - apiVersion
+                - kind
+                - name
+                type: object
+              resource:
+                properties:
+                  deletionTimestamp:
+                    format: date-time
+                    type: string
+                  exists:
+                    type: boolean
+                  generation:
+                    format: int64
+                    type: integer
+                  lastUpdatedAt:
+                    format: date-time
+                    type: string
+                  observation:
+                    properties:
+                      message:
+                        type: string
+                      reason:
+                        type: string
+                    required:
+                    - reason
+                    type: object
+                  observedAgainstRevision:
+                    type: string
+                  ref:
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    type: object
+                  resourceVersion:
+                    type: string
+                  status:
+                    type: object
+                    x-kubernetes-preserve-unknown-fields: true
+                required:
+                - observation
+                - ref
+                type: object
             type: object
         required:
         - spec

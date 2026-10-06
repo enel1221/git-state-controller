@@ -46,3 +46,26 @@ func TestRejectMalformed(t *testing.T) {
 		}
 	}
 }
+
+func TestManagedAnnotationsAndForeignUID(t *testing.T) {
+	raw := []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"example","annotations":{"gitops.example.io/source-uid":"forged","other":"keep"}},"spec":{"largeInteger":9007199254740993},"status":{"drop":true}}`)
+	content, hash, err := RenderManaged(raw, "demo", "wrapper", "real-uid", "managed")
+	if err != nil {
+		t.Fatal(err)
+	}
+	namespace, name, uid, state := Ownership(content)
+	if namespace != "demo" || name != "wrapper" || uid != "real-uid" || state != "managed" || hash != Hash(content) {
+		t.Fatal("reserved annotations not authoritative")
+	}
+	object, err := Decode(content)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !bytes.Contains(object["spec"], []byte("9007199254740993")) || object["status"] != nil {
+		t.Fatal("authored spec changed or status persisted")
+	}
+	_, _, foreign, _ := Ownership([]byte(`{"metadata":{"annotations":{"gitops.example.io/source-uid":"foreign","bad-external-annotation":true}}}`))
+	if foreign != "foreign" {
+		t.Fatal("unrelated malformed annotation hid a foreign owner")
+	}
+}

@@ -32,7 +32,7 @@ spec:
             readOnlyRootFilesystem: true
             allowPrivilegeEscalation: false
             capabilities: {drop: [ALL]}
-          ports: [{name: health, containerPort: 8081}]
+          ports: [{name: health, containerPort: 8081}, {name: metrics, containerPort: 8080}]
           readinessProbe:
             httpGet: {path: /readyz, port: health}
           livenessProbe:

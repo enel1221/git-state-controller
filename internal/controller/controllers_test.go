@@ -37,7 +37,7 @@ func fixture(t *testing.T) (*testgit.Server, *GitResourceReconciler, *api.GitRes
 	cr := &api.GitResource{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "demo", UID: "original-uid", Generation: 1}, Spec: api.GitResourceSpec{Repository: api.Repository{URL: s.URL, Branch: "main", Path: "demo/example.yaml"}, Manifest: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"example"},"data":{"greeting":"hello"}}`)}}}
 	config := &api.ClusterGitConfig{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: api.ClusterGitConfigSpec{Credentials: api.Credentials{Source: "Secret", SecretRef: api.SecretReference{Namespace: "git-state-system", Name: "writer"}}}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "git-state-system", Name: "writer"}, Data: map[string][]byte{"username": []byte("bot"), "password": []byte("password")}}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.GitResource{}).WithObjects(cr, config, secret).Build()
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.GitResource{}, &api.ClusterGitConfig{}).WithObjects(cr, config, secret).Build()
 	return s, &GitResourceReconciler{Client: c, Reader: c, Publisher: &writer.Publisher{}, Namespace: "git-state-system", AllowHTTP: true}, cr
 }
 func reconcileCR(t *testing.T, r *GitResourceReconciler, cr *api.GitResource) {
@@ -51,12 +51,12 @@ func TestGenerationAndStatusConflict(t *testing.T) {
 	key := client.ObjectKeyFromObject(cr)
 	base := r.Client
 	conflicts := 0
-	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
-		if sub == "status" && conflicts == 0 {
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		if _, ok := obj.(*api.GitResource); ok && sub == "status" && conflicts == 0 {
 			conflicts++
 			return apierrors.NewConflict(schema.GroupResource{Group: api.GroupVersion.Group, Resource: "gitresources"}, cr.Name, errors.New("test conflict"))
 		}
-		return c.SubResource(sub).Update(ctx, obj, opts...)
+		return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
 	}})
 	r.Publisher.BeforePush = func() {
 		current := &api.GitResource{}
@@ -154,11 +154,11 @@ func TestGitDeadlineStillRecordsFailure(t *testing.T) {
 				<-ctx.Done()
 				return ctx.Err()
 			}
-			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(ctx context.Context, c client.Client, sub string, obj client.Object, opts ...client.SubResourceUpdateOption) error {
+			r.Client = interceptor.NewClient(r.Client.(client.WithWatch), interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
 				if err := ctx.Err(); err != nil {
 					return err
 				}
-				return c.SubResource(sub).Update(ctx, obj, opts...)
+				return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
 			}})
 			if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: key}); err == nil {
 				t.Fatal("timeout reported success")
@@ -237,8 +237,11 @@ func TestInventoryPreservesOtherFieldsAndFailure(t *testing.T) {
 func TestFailedStatusPersistenceRecoversWithoutCommit(t *testing.T) {
 	s, r, cr := fixture(t)
 	base := r.Client
-	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourceUpdate: func(context.Context, client.Client, string, client.Object, ...client.SubResourceUpdateOption) error {
-		return errors.New("status unavailable")
+	r.Client = interceptor.NewClient(base.(client.WithWatch), interceptor.Funcs{SubResourcePatch: func(ctx context.Context, c client.Client, sub string, obj client.Object, patch client.Patch, opts ...client.SubResourcePatchOption) error {
+		if gr, ok := obj.(*api.GitResource); ok && gr.Status.LastPublishedRevision != "" {
+			return errors.New("status unavailable")
+		}
+		return c.SubResource(sub).Patch(ctx, obj, patch, opts...)
 	}})
 	if _, err := r.Reconcile(context.Background(), ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cr)}); err == nil {
 		t.Fatal("status failure swallowed")
@@ -421,7 +424,7 @@ func TestTwentyConcurrentResourcesWithFourWorkers(t *testing.T) {
 		if got.Status.LastPublishedGeneration != 1 || len(got.Status.LastPublishedRevision) != 40 {
 			t.Fatal("missing publication", cr.Name, got.Status)
 		}
-		want, _, err := manifest.Render(cr.Spec.Manifest.Raw)
+		want, _, err := manifest.RenderManaged(cr.Spec.Manifest.Raw, cr.Namespace, cr.Name, string(cr.UID), "managed")
 		if err != nil {
 			t.Fatal(err)
 		}

@@ -1,8 +1,9 @@
 # Repository guide
 
-This example follows SPEC.md. Keep production code under `internal/`, use go-git
+This example follows SPEC-v0.2.md, which supersedes SPEC.md. Keep production code under `internal/`, use go-git
 for Git operations, and keep Git publication independent of the ApplicationSet
-inventory reconciliation. Do not add deferred platform features.
+inventory reconciliation. The status observer uses no Git client and reads exact
+targets uncached. Do not add deferred platform features.
 
 The API uses Kubebuilder v4.16.0's ordinary Go scaffold. Never hand-edit
 `PROJECT`, `api/**/zz_generated.*`, `config/crd/bases/*`, or `config/rbac/role.yaml`.

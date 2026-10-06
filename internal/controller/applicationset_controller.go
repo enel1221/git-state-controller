@@ -18,6 +18,7 @@ import (
 	"k8s.io/client-go/tools/events"
 	"k8s.io/client-go/util/retry"
 	ctrl "sigs.k8s.io/controller-runtime"
+	"sigs.k8s.io/controller-runtime/pkg/builder"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/handler"
@@ -70,7 +71,8 @@ func PublicationElements(resources []api.GitResource) []interface{} {
 			continue
 		}
 		elements = append(elements, map[string]interface{}{
-			"namespace": cr.Namespace, "name": cr.Name, "uid": string(cr.UID), "applicationName": ApplicationName(cr),
+			"namespace": cr.Namespace, "name": cr.Name, "uid": string(cr.UID), "applicationName": applicationRef(cr, "argocd").Name,
+			"branch": cr.Spec.Repository.Branch, "path": cr.Spec.Repository.Path, "managementState": "managed",
 			"repoURL": cr.Spec.Repository.URL, "directory": path.Dir(cr.Spec.Repository.Path), "filename": path.Base(cr.Spec.Repository.Path), "revision": cr.Status.LastPublishedRevision,
 		})
 	}
@@ -101,7 +103,7 @@ func (r *ApplicationSetReconciler) Reconcile(ctx context.Context, _ ctrl.Request
 		if !ok {
 			return fmt.Errorf("sample ApplicationSet first generator must be List")
 		}
-		desired := PublicationElements(resources.Items)
+		desired := retainedElements(resources.Items, list["elements"])
 		if reflect.DeepEqual(list["elements"], desired) {
 			return nil
 		}
@@ -143,6 +145,105 @@ func (r *ApplicationSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	return ctrl.NewControllerManagedBy(mgr).Named("applicationset-inventory").
-		Watches(ApplicationSetObject(), enqueue).Watches(&api.GitResource{}, enqueue).
+		Watches(ApplicationSetObject(), enqueue).Watches(&api.GitResource{}, enqueue, builder.WithPredicates(inventoryPredicate)).
 		WatchesRawSource(source.Channel(startup, enqueue)).Complete(r)
+}
+
+func stringField(entry map[string]interface{}, key string) string {
+	value, _ := entry[key].(string)
+	return value
+}
+func listElements(set *unstructured.Unstructured) ([]map[string]interface{}, error) {
+	raw, found, err := unstructured.NestedSlice(set.Object, "spec", "generators")
+	if err != nil || !found || len(raw) == 0 {
+		return nil, fmt.Errorf("ApplicationSet requires first List generator")
+	}
+	generator, ok := raw[0].(map[string]interface{})
+	if !ok {
+		return nil, fmt.Errorf("invalid generator")
+	}
+	entries, _, err := unstructured.NestedSlice(generator, "list", "elements")
+	if err != nil {
+		return nil, err
+	}
+	result := []map[string]interface{}{}
+	for _, entry := range entries {
+		obj, ok := entry.(map[string]interface{})
+		if !ok {
+			return nil, fmt.Errorf("invalid inventory element")
+		}
+		result = append(result, obj)
+	}
+	return result, nil
+}
+func entryMatches(entry map[string]interface{}, cr *api.GitResource) bool {
+	return stringField(entry, "repoURL") == cr.Spec.Repository.URL && stringField(entry, "directory") == path.Dir(cr.Spec.Repository.Path) && stringField(entry, "filename") == path.Base(cr.Spec.Repository.Path) && (stringField(entry, "branch") == "" || stringField(entry, "branch") == cr.Spec.Repository.Branch) && (stringField(entry, "path") == "" || stringField(entry, "path") == cr.Spec.Repository.Path)
+}
+
+// Merge against the fresh inventory: paused entries are byte-for-byte retained;
+// orphaned entries survive missing and terminating owners until verified adoption.
+func retainedElements(resources []api.GitResource, raw interface{}) []interface{} {
+	old := []map[string]interface{}{}
+	if entries, ok := raw.([]interface{}); ok {
+		for _, entry := range entries {
+			if e, ok := entry.(map[string]interface{}); ok {
+				old = append(old, e)
+			}
+		}
+	}
+	result := map[string]map[string]interface{}{}
+	for _, e := range old {
+		if stringField(e, "managementState") == "orphaned" {
+			result[stringField(e, "applicationName")] = e
+		}
+	}
+	for i := range resources {
+		cr := &resources[i]
+		var existing map[string]interface{}
+		for _, e := range old {
+			if stringField(e, "uid") == string(cr.UID) {
+				existing = e
+				break
+			}
+		}
+		if paused(cr) {
+			if existing != nil {
+				result[stringField(existing, "applicationName")] = existing
+			}
+			continue
+		}
+		elements := PublicationElements([]api.GitResource{*cr})
+		if len(elements) == 0 {
+			continue
+		}
+		desired := elements[0].(map[string]interface{})
+		name := stringField(desired, "applicationName")
+		if existing != nil {
+			name = stringField(existing, "applicationName")
+			desired["applicationName"] = name
+		}
+		if retained, ok := result[name]; ok {
+			if stringField(retained, "uid") == string(cr.UID) {
+				continue
+			}
+			if !adopting(cr) || !publicationCurrent(cr) {
+				continue
+			}
+		}
+		if cr.Status.Cleanup != nil && cr.Status.Cleanup.Policy == "Orphan" && cr.Status.Cleanup.Revision != "" {
+			desired["revision"] = cr.Status.Cleanup.Revision
+			desired["managementState"] = "orphaned"
+		}
+		result[name] = desired
+	}
+	names := make([]string, 0, len(result))
+	for name := range result {
+		names = append(names, name)
+	}
+	sort.Strings(names)
+	elements := []interface{}{}
+	for _, name := range names {
+		elements = append(elements, result[name])
+	}
+	return elements
 }

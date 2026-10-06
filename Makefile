@@ -84,7 +84,7 @@ test-unit: generate manifests fmt vet ## Run deterministic, controller and real 
 	go test -race ./internal/... ./cmd/... ./hack/bootstrap/... ./test/devstack/...
 
 test-api: generate manifests setup-envtest ## Run real API admission, defaults, status and finalizer tests.
-	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -tags=integration ./test/integration -v
+	KUBEBUILDER_ASSETS="$$($(ENVTEST) use $(ENVTEST_K8S_VERSION) --bin-dir $(LOCALBIN) -p path)" go test -tags=integration ./test/integration ./internal/controller -v
 
 test-e2e: check-stack ## Exercise publication, Argo handoff, outages, restart and redeployment.
 	KUBECONFIG="$(CURDIR)/.dev/kubeconfig" go test -tags=e2e ./test/e2e -v -timeout=30m || { hack/diagnostics.sh; exit 1; }

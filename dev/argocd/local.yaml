@@ -23,3 +23,27 @@ spec:
       protocol: TCP
       targetPort: 8080
       nodePort: 30444
+---
+apiVersion: v1
+kind: ConfigMap
+metadata:
+  name: argocd-cm
+data:
+  resource.customizations.health.testing.gitops.example.io_StatusObject: |
+    local hs = {status = "Progressing", message = "Waiting for Ready"}
+    if obj.status ~= nil and obj.status.conditions ~= nil then
+      for _, c in ipairs(obj.status.conditions) do
+        if c.type == "Ready" then
+          hs.message = c.message or c.reason or ""
+          if c.observedGeneration ~= nil and c.observedGeneration ~= obj.metadata.generation then
+            hs.message = "Ready describes an older generation"
+          elseif c.status == "True" then
+            hs.status = "Healthy"
+          elseif c.status == "False" then
+            hs.status = "Degraded"
+          end
+          return hs
+        end
+      end
+    end
+    return hs

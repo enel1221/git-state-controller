@@ -105,6 +105,8 @@ ARGO
   k rollout status -n argocd deployment/argocd-repo-server --timeout=300s
   k rollout status -n argocd deployment/argocd-applicationset-controller --timeout=300s
   k rollout status -n argocd statefulset/argocd-application-controller --timeout=300s
+  k apply -f dev/bootstrap/statusobject.yaml
+  k wait --for=condition=Established crd/statusobjects.testing.gitops.example.io --timeout=120s
   k apply -f dev/bootstrap/project.yaml
   make generate manifests
   k apply -f config/crd/bases

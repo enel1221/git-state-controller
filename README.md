@@ -234,3 +234,39 @@ Deletion removes the current file, not historical commits. Removing the cleanup
 finalizer manually bypasses Git cleanup. Wait for an old Application's cascading
 cleanup before recreating the same downstream workload. Git publication,
 Kubernetes status, and Argo application are separate eventual-convergence steps.
+
+## v0.2 read model and lifecycle
+
+The existing four commands remain `make up`, `make test`, `make dev`, and
+`make clean`. The manager adds upstream status mirrors, exact-resource polling,
+revision-correlated Ready/Synced, informational GitDrift, pause, orphan retention
+and one-time adoption. Existing v0.1 Application identities are preserved.
+
+```sh
+kubectl get gitresources -A
+kubectl get gitresource example-config -n demo -o jsonpath='{.status.argoCD.status}'
+kubectl get gitresource example-config -n demo -o jsonpath='{.status.resource}'
+kubectl get clustergitconfig default -o yaml
+```
+
+A ConfigMap has `resource.exists: true` and no manufactured `resource.status`.
+Forbidden and SnapshotTooLarge observations clear raw payloads and expose a
+small diagnostic, without blocking Git publication. A status-bearing fixture is
+available as `testing.gitops.example.io/v1alpha1, Kind=StatusObject`; the stack
+installs its CRD, explicit GET RBAC and an Argo health check for its Ready condition.
+
+Pause/resume, orphan and re-adopt examples and upgrade/recovery rules are in
+[docs/lifecycle.md](docs/lifecycle.md). Snapshot limits, readiness comparisons,
+credential evidence and the trusted-only sensitive-data contract are in
+[docs/status.md](docs/status.md). See [docs/git-history.md](docs/git-history.md)
+for path-scoped `git log`, diffs and restoration: Git supplies history, while
+changing `spec.manifest` supplies a new publication.
+
+The 20-resource live test writes ignored `reports/timing-v02-*/results.json`
+and `metrics.prom`: raw create/update/publication/sync/deletion timings,
+throughput and p50/p95/max, actual Git transport durations/retries, snapshot sizes
+and status-patch counts. These are measurements from that run with one-second
+polling overhead, not scale guarantees. The manager's private metrics endpoint
+is port 8080 and uses low-cardinality labels.
+
+Tested versions and measurements are recorded in [docs/verification.md](docs/verification.md).
