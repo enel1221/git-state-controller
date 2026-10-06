@@ -179,6 +179,7 @@ func TestObserverSnapshotsNoopAndReplacement(t *testing.T) {
 	}
 	_ = c.Get(ctx, client.ObjectKeyFromObject(app), app)
 	app.SetLabels(map[string]string{"metadata": "only"})
+	app.SetGeneration(app.GetGeneration() + 1)
 	_ = c.Update(ctx, app)
 	_, _ = r.Reconcile(ctx, req)
 	_ = c.Get(ctx, req.NamespacedName, cr)
@@ -287,7 +288,7 @@ func TestStatusConflictMergesWriters(t *testing.T) {
 		t.Fatal("writer fields lost", cr.Status)
 	}
 	old := cr.Status.DeepCopy()
-	if err := patchStatus(context.Background(), c, c, cr, func(*api.GitResource) {}); err != nil {
+	if err := patchStatus(context.Background(), c, c, cr, "publisher", func(*api.GitResource) {}); err != nil {
 		t.Fatal(err)
 	}
 	_ = c.Get(context.Background(), client.ObjectKeyFromObject(cr), cr)

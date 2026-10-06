@@ -4,6 +4,8 @@ import (
 	"reflect"
 
 	api "github.com/inelson/git-state-controller/api/v1alpha1"
+	"github.com/inelson/git-state-controller/internal/manifest"
+	"k8s.io/apimachinery/pkg/apis/meta/v1/unstructured"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 	"sigs.k8s.io/controller-runtime/pkg/event"
 	"sigs.k8s.io/controller-runtime/pkg/predicate"
@@ -39,4 +41,35 @@ var observerPredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bo
 		return false
 	}
 	return inventoryPredicate.Update(e) || old.Status.LastPublishedGeneration != new.Status.LastPublishedGeneration || !reflect.DeepEqual(old.Status.PublishedResourceRef, new.Status.PublishedResourceRef) || publicationCurrent(old) != publicationCurrent(new)
+}}
+
+func objectFieldChanged(e event.UpdateEvent, fields ...string) bool {
+	old, oldOK := e.ObjectOld.(*unstructured.Unstructured)
+	new, newOK := e.ObjectNew.(*unstructured.Unstructured)
+	if !oldOK || !newOK {
+		return true
+	}
+	a, foundA, errA := unstructured.NestedFieldNoCopy(old.Object, fields...)
+	b, foundB, errB := unstructured.NestedFieldNoCopy(new.Object, fields...)
+	return foundA != foundB || errA != nil || errB != nil || !reflect.DeepEqual(a, b)
+}
+
+func identityChanged(e event.UpdateEvent) bool {
+	return e.ObjectOld.GetUID() != e.ObjectNew.GetUID() || !e.ObjectOld.GetDeletionTimestamp().Equal(e.ObjectNew.GetDeletionTimestamp())
+}
+
+var applicationSetPredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	return identityChanged(e) || objectFieldChanged(e, "spec")
+}}
+
+var applicationPredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	if identityChanged(e) || !reflect.DeepEqual(e.ObjectOld.GetOwnerReferences(), e.ObjectNew.GetOwnerReferences()) {
+		return true
+	}
+	for _, key := range []string{SourceAnnotation, UIDAnnotation, SetAnnotation, manifest.StateAnnotation} {
+		if e.ObjectOld.GetAnnotations()[key] != e.ObjectNew.GetAnnotations()[key] {
+			return true
+		}
+	}
+	return e.ObjectOld.GetLabels()["gitops.example.io/managed"] != e.ObjectNew.GetLabels()["gitops.example.io/managed"] || objectFieldChanged(e, "spec", "source") || objectFieldChanged(e, "spec", "sources") || objectFieldChanged(e, "spec", "destination") || objectFieldChanged(e, "status")
 }}

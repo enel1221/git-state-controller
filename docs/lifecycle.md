@@ -9,9 +9,13 @@ canonical content hash. Authored spec fields are preserved.
 
 A new path must be absent or owned by the wrapper UID. An existing unowned path
 fails Published with PathAlreadyExists. Every retry checks current ownership;
-normal updates cannot steal another UID's file. Branch races fetch the new head,
-reapply only this path and use a normal push. Verified prior commits/path-scoped
-UID trailers recover interrupted publication without duplicate content commits;
+normal updates cannot steal another UID's file. Mutating attempts refresh their
+isolated clone before building the commit, then fetch into that same worktree to
+verify the normal push. Branch races reread the wrapper and reapply only this path
+from a fresh head. Three local attempts use exponential jitter from a 500 ms base;
+continued contention reports PublishPending and schedules another attempt.
+Verified prior commits/path-scoped UID trailers recover interrupted publication
+without duplicate content commits;
 ambiguous ownership requires explicit adoption or reports RecoveryRequired.
 
 Publication intent is a canonical manifest change, not every event or generation.

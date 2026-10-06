@@ -24,6 +24,7 @@ import (
 	corev1 "k8s.io/api/core/v1"
 	apierrors "k8s.io/apimachinery/pkg/api/errors"
 	"k8s.io/apimachinery/pkg/api/meta"
+	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/types"
 	"sigs.k8s.io/controller-runtime/pkg/client"
 )
@@ -92,9 +93,32 @@ func (s *stack) metrics(t *testing.T) (map[string]float64, []byte) {
 		}
 		name := strings.Split(fields[0], "{")[0]
 		values[name] += v
+		if fields[0] != name {
+			values[fields[0]] = v
+		}
 	}
 	return values, raw
 }
+func metricDeltas(before, after map[string]float64, prefix string) map[string]float64 {
+	result := map[string]float64{}
+	for key, value := range after {
+		if strings.HasPrefix(key, prefix+"{") {
+			result[key] = value - before[key]
+		}
+	}
+	return result
+}
+
+func configurationPatches(before, after map[string]float64) float64 {
+	var count float64
+	for key, value := range metricDeltas(before, after, "git_state_status_patches_total") {
+		if strings.Contains(key, `writer="config"`) {
+			count += value
+		}
+	}
+	return count
+}
+
 func (s *stack) measureTwenty(t *testing.T) {
 	t.Helper()
 	start := time.Now()
@@ -108,6 +132,38 @@ func (s *stack) measureTwenty(t *testing.T) {
 		t.Fatal(err)
 	}
 	defer stream.Stop()
+	configs := &api.ClusterGitConfigList{}
+	if err := s.List(watchCtx, configs); err != nil {
+		t.Fatal(err)
+	}
+	configStream, err := s.watcher.Watch(watchCtx, &api.ClusterGitConfigList{}, &client.ListOptions{Raw: &metav1.ListOptions{ResourceVersion: configs.ResourceVersion}})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer configStream.Stop()
+	configWrites := 0
+	configDone := make(chan struct{})
+	go func() {
+		defer close(configDone)
+		previous := map[string][]byte{}
+		for _, config := range configs.Items {
+			previous[config.Name], _ = json.Marshal(config.Status)
+		}
+		for event := range configStream.ResultChan() {
+			config, ok := event.Object.(*api.ClusterGitConfig)
+			if !ok {
+				continue
+			}
+			raw, _ := json.Marshal(config.Status)
+			if !bytes.Equal(previous[config.Name], raw) {
+				configWrites++
+			}
+			previous[config.Name] = raw
+		}
+		if watchCtx.Err() == nil {
+			t.Error("configuration measurement watch closed before completion")
+		}
+	}()
 	writes := map[string]int{}
 	previous := map[string][]byte{}
 	var mu sync.Mutex
@@ -246,7 +302,9 @@ func (s *stack) measureTwenty(t *testing.T) {
 	}
 	watchCancel()
 	stream.Stop()
+	configStream.Stop()
 	<-done
+	<-configDone
 	mu.Lock()
 	for name, timing := range cases {
 		timing.StatusWrites = writes[name]
@@ -276,7 +334,7 @@ func (s *stack) measureTwenty(t *testing.T) {
 	for key, values := range gitGroups {
 		gitSummaries[key] = distribution(values)
 	}
-	report := map[string]interface{}{"startedAt": start, "count": 20, "publicationWorkers": 4, "throughput_publications_per_second": 20 / lastPublication.Sub(start).Seconds(), "summaries": summaries, "cases": raw, "git_operations": gitOps, "git_duration_seconds": gitSummaries, "rejected_push_retries_logged": retries, "rejected_push_retries_metric": after["git_state_rejected_push_retries_total"] - before["git_state_rejected_push_retries_total"], "status_patches": after["git_state_status_patches_total"] - before["git_state_status_patches_total"], "observations": after["git_state_observations_total"] - before["git_state_observations_total"], "measurement_resolution": "one-second polling; API requests add overhead"}
+	report := map[string]interface{}{"startedAt": start, "count": 20, "publicationWorkers": 4, "throughput_publications_per_second": 20 / lastPublication.Sub(start).Seconds(), "summaries": summaries, "cases": raw, "git_operations": gitOps, "git_duration_seconds": gitSummaries, "rejected_push_retries_logged": retries, "rejected_push_retries_metric": after["git_state_rejected_push_retries_total"] - before["git_state_rejected_push_retries_total"], "status_patches": after["git_state_status_patches_total"] - before["git_state_status_patches_total"] - configurationPatches(before, after), "observations": after["git_state_observations_total"] - before["git_state_observations_total"], "configuration_status_changes": configWrites, "api_requests": metricDeltas(before, after, "rest_client_requests_total"), "reconciliations": metricDeltas(before, after, "controller_runtime_reconcile_total"), "status_patch_outcomes": metricDeltas(before, after, "git_state_status_patches_total"), "measurement_resolution": "one-second polling; API requests add overhead"}
 	dir := filepath.Join(s.root, "reports", fmt.Sprintf("timing-v02-%d", start.Unix()))
 	if err := os.MkdirAll(dir, 0700); err != nil {
 		t.Fatal(err)
@@ -291,5 +349,5 @@ func (s *stack) measureTwenty(t *testing.T) {
 	if err := os.WriteFile(filepath.Join(dir, "metrics.prom"), metricRaw, 0600); err != nil {
 		t.Fatal(err)
 	}
-	t.Logf("20-resource timing results: %s; throughput %.2f publications/s; status patches %.0f", dir, 20/lastPublication.Sub(start).Seconds(), after["git_state_status_patches_total"]-before["git_state_status_patches_total"])
+	t.Logf("20-resource timing results: %s; throughput %.2f publications/s; status patches %.0f", dir, 20/lastPublication.Sub(start).Seconds(), report["status_patches"].(float64))
 }

@@ -145,7 +145,7 @@ func (r *ApplicationSetReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		return err
 	}
 	return ctrl.NewControllerManagedBy(mgr).Named("applicationset-inventory").
-		Watches(ApplicationSetObject(), enqueue).Watches(&api.GitResource{}, enqueue, builder.WithPredicates(inventoryPredicate)).
+		Watches(ApplicationSetObject(), enqueue, builder.WithPredicates(applicationSetPredicate)).Watches(&api.GitResource{}, enqueue, builder.WithPredicates(inventoryPredicate)).
 		WatchesRawSource(source.Channel(startup, enqueue)).Complete(r)
 }
 

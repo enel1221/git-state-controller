@@ -310,7 +310,7 @@ func limitMirrors(cr *api.GitResource) {
 }
 
 // Every writer merges with the latest API object. Mutators own only their fields.
-func patchStatus(ctx context.Context, c client.Client, reader client.Reader, processed *api.GitResource, mutate func(*api.GitResource)) error {
+func patchStatus(ctx context.Context, c client.Client, reader client.Reader, processed *api.GitResource, writer string, mutate func(*api.GitResource)) error {
 	fallback := false
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		current := &api.GitResource{}
@@ -336,7 +336,7 @@ func patchStatus(ctx context.Context, c client.Client, reader client.Reader, pro
 			// Re-enter through the same fresh-read conflict path once with small diagnostics.
 			return apierrors.NewConflict(api.GroupVersion.WithResource("gitresources").GroupResource(), current.Name, fmt.Errorf("retry without oversized snapshots"))
 		}
-		statusPatchCounter.WithLabelValues(outcome(err)).Inc()
+		statusPatchCounter.WithLabelValues(writer, outcome(err)).Inc()
 		return err
 	})
 }

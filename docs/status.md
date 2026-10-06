@@ -44,11 +44,16 @@ controller's status or its own generated Application is unsupported.
 
 A semantic no-op does not patch status. Source resourceVersion is associated with
 the snapshot, not persisted as a heartbeat for metadata-only changes, and never
-compared numerically. Condition transitions change their time only when their
-truth value changes. Publication and observation use optimistic status patches,
+compared numerically. Application generation is likewise associated with the
+mirrored payload; an envelope-only change preserves it. Target generation remains
+readiness evidence and is observed when it changes. Condition transitions change
+their time only when their truth value changes. Publication and observation use optimistic status patches,
 merge independently owned fields, and recompute Ready/Synced after merging.
-Application status events enqueue only the observer; config status events do not
-enqueue Git workers or rewrite the inventory.
+Application identity/tracking, selected source/destination and any raw status
+change enqueue the observer. ApplicationSet status-only events do not enqueue
+inventory reconciliation; config status events do not enqueue Git workers.
+Publication and its GitDrift evidence share one patch, while durable identity and
+cleanup checkpoints remain separate.
 
 This example is trusted-only. Reading a GitResource grants access to its copied
 upstream messages and outputs, even if the caller cannot read those source
@@ -63,11 +68,17 @@ with sanitized transport diagnostics. Fetch success does not prove push access;
 there are no probe commits. Evidence using an old Secret cannot certify a rotated
 Secret. Concurrent records are last reported evidence, not an ordered audit log.
 A denied repository does not gate other wrappers. Argo credentials remain separate.
+Access evidence is buffered once per reconcile, with verified Push evidence taking
+precedence over verification Fetch. Identical evidence causes no patch. Expected
+branch contention reports PublishPending rather than a false access failure;
+authentication and transport failures retain diagnostics.
 
-The private manager metrics endpoint listens on 8080. Metrics have only operation,
-outcome and observation-reason labels: Git transport duration, rejected-push
-retries, observation counts and status-patch counts, plus controller-runtime's
-metrics. No CR/repository/path/SHA/UID metric labels. Polling costs roughly N/15
-exact target GETs per second plus events. Full status/watch bandwidth scales with
+The private manager metrics endpoint listens on 8080. Metrics use low-cardinality
+operation, writer and outcome labels: Git transport duration distinguishes
+Clone/Fetch/Push; status-patch counts distinguish
+publisher/observer/config and success/conflict/error. Rejected-push retries,
+observation counts and controller-runtime metrics are also available. No
+CR/repository/path/SHA/UID metric labels. Polling costs roughly N/15 exact target
+GETs per second plus events. Full status/watch bandwidth scales with
 object size and churn; the one ApplicationSet list grows with active and retained
 entries. The example does not promise a hardware-independent scale threshold.

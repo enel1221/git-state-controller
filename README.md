@@ -270,3 +270,5 @@ polling overhead, not scale guarantees. The manager's private metrics endpoint
 is port 8080 and uses low-cardinality labels.
 
 Tested versions and measurements are recorded in [docs/verification.md](docs/verification.md).
+The measured status and Git retry improvements, including seven compared strategies,
+are in [docs/optimization.md](docs/optimization.md).

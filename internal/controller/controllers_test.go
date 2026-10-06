@@ -393,15 +393,20 @@ func TestTwentyConcurrentResourcesWithFourWorkers(t *testing.T) {
 			for cr := range jobs {
 				req := ctrl.Request{NamespacedName: client.ObjectKeyFromObject(cr)}
 				for {
-					_, err := r.Reconcile(ctx, req)
-					if err == nil {
+					result, err := r.Reconcile(ctx, req)
+					latest := &api.GitResource{}
+					if err == nil && r.Get(ctx, client.ObjectKeyFromObject(cr), latest) == nil && publicationCurrent(latest) {
 						break
 					}
 					if ctx.Err() != nil {
 						failures <- fmt.Errorf("%s: %w", cr.Name, err)
 						break
 					}
-					timer := time.NewTimer(50 * time.Millisecond)
+					delay := result.RequeueAfter
+					if delay == 0 {
+						delay = 50 * time.Millisecond
+					}
+					timer := time.NewTimer(delay)
 					select {
 					case <-ctx.Done():
 						timer.Stop()

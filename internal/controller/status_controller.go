@@ -78,9 +78,12 @@ func appStable(old, next *api.ApplicationSnapshot) {
 	a, b := old.DeepCopy(), next.DeepCopy()
 	a.ResourceVersion = ""
 	b.ResourceVersion = ""
+	a.Generation = nil
+	b.Generation = nil
 	a.LastUpdatedAt = nil
 	b.LastUpdatedAt = nil
 	if reflect.DeepEqual(a, b) {
+		next.Generation = old.Generation
 		next.ResourceVersion = old.ResourceVersion
 		next.LastUpdatedAt = old.LastUpdatedAt
 	}
@@ -307,7 +310,7 @@ func (r *StatusReconciler) Reconcile(ctx context.Context, req ctrl.Request) (ctr
 	appStable(cr.Status.ArgoCD, a)
 	resourceStable(cr.Status.Resource, resource)
 	observationCounter.WithLabelValues(resource.Observation.Reason).Inc()
-	err := patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+	err := patchStatus(ctx, r.Client, r.Reader, cr, "observer", func(current *api.GitResource) {
 		if current.Generation != cr.Generation || current.Status.LastPublishedRevision != cr.Status.LastPublishedRevision || !reflect.DeepEqual(current.Status.PublishedResourceRef, cr.Status.PublishedResourceRef) {
 			return
 		}
@@ -341,7 +344,7 @@ func (r *StatusReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		}
 		return []reconcile.Request{{NamespacedName: key}}
 	})
-	return ctrl.NewControllerManagedBy(mgr).Named("gitresource-status").For(&api.GitResource{}, builder.WithPredicates(observerPredicate)).Watches(ApplicationObject(), events).Complete(r)
+	return ctrl.NewControllerManagedBy(mgr).Named("gitresource-status").For(&api.GitResource{}, builder.WithPredicates(observerPredicate)).Watches(ApplicationObject(), events, builder.WithPredicates(applicationPredicate)).Complete(r)
 }
 func stringsSplitSource(source string) []string {
 	for i, c := range source {

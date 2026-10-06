@@ -102,6 +102,11 @@ func (r *GitResourceReconciler) resolve(ctx context.Context, cr *api.GitResource
 			msg = "Git access failed; check repository permissions and connectivity."
 		}
 		evidence = &api.GitAccessObservation{RepositoryURL: op.URL, Operation: operation, Success: success, Reason: why, Message: msg, ConfigGeneration: config.Generation, SecretUID: string(secret.UID), SecretResourceVersion: secret.ResourceVersion, LastUpdatedAt: metav1.Now()}
+	}
+	op.FlushAccess = func() {
+		if evidence == nil {
+			return
+		}
 		evidenceCtx, cancel := context.WithTimeout(context.WithoutCancel(ctx), 5*time.Second)
 		defer cancel()
 		r.recordConfig(evidenceCtx, config, secret, true, "CredentialsLoaded", evidence)
@@ -148,11 +153,11 @@ func (r *GitResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 		return ctrl.Result{}, nil
 	}
 	if paused(cr) {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(*api.GitResource) {})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, "publisher", func(*api.GitResource) {})
 	}
 	if !cr.DeletionTimestamp.IsZero() && cr.Status.Cleanup == nil {
 
-		if err := patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+		if err := patchStatus(ctx, r.Client, r.Reader, cr, "publisher", func(current *api.GitResource) {
 			if current.Status.Cleanup == nil && !paused(current) {
 				policy := current.Spec.DeletionPolicy
 				if policy == "" {
@@ -177,12 +182,17 @@ func (r *GitResourceReconciler) Reconcile(ctx context.Context, req ctrl.Request)
 	}
 	var result gitwriter.Result
 	var op gitwriter.Operation
+	defer func() {
+		if op.FlushAccess != nil {
+			op.FlushAccess()
+		}
+	}()
 	var reason string
 	var err error
 attempts:
 	for attempt := 0; attempt < 3; attempt++ {
 		if attempt > 0 {
-			timer := time.NewTimer(time.Duration(30+rand.IntN(100)) * time.Millisecond)
+			timer := time.NewTimer(publicationRetryDelay(attempt))
 			select {
 			case <-ctx.Done():
 				timer.Stop()
@@ -227,7 +237,7 @@ attempts:
 			return nil
 		}
 		if cr.Status.ApplicationRef == nil || *cr.Status.ApplicationRef != ref {
-			if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+			if err = patchStatus(ctx, r.Client, r.Reader, cr, "publisher", func(current *api.GitResource) {
 				if current.Generation == cr.Generation && !paused(current) {
 					current.Status.ApplicationRef = &ref
 				}
@@ -273,18 +283,17 @@ attempts:
 	ctx, statusCancel := context.WithTimeout(requestCtx, 30*time.Second)
 	defer statusCancel()
 	if errors.Is(err, gitwriter.ErrPaused) {
-		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(*api.GitResource) {})
+		return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, "publisher", func(*api.GitResource) {})
 	}
 	if err != nil {
+		if errors.Is(err, gitwriter.ErrBranchChanged) {
+			return ctrl.Result{RequeueAfter: publicationRetryDelay(3)}, r.setStatus(ctx, cr, false, "PublishPending", "Remote branch advanced; retrying publication.", gitwriter.Result{}, "")
+		}
 		if cr.DeletionTimestamp.IsZero() && cr.Status.LastPublishedRevision != "" && (op.ReadOnly || len(op.Content) > 0 && manifest.Hash(op.Content) == cr.Status.LastPublishedContentHash) {
 			if statusErr := r.setStatus(ctx, cr, true, "Unchanged", "Desired manifest publication verified in Git.", gitwriter.Result{Revision: cr.Status.LastPublishedRevision}, cr.Status.LastPublishedContentHash); statusErr != nil {
 				return ctrl.Result{}, statusErr
 			}
-			return ctrl.Result{RequeueAfter: 30 * time.Second}, patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
-				if current.Generation == cr.Generation {
-					condition(current, "GitDrift", metav1.ConditionUnknown, "AccessFailed", "Cannot compare the managed file with the published content.")
-				}
-			})
+			return ctrl.Result{RequeueAfter: 30 * time.Second}, nil
 		}
 		if reason == "" {
 			reason = "PublishFailed"
@@ -305,16 +314,11 @@ attempts:
 		if statusErr != nil {
 			return ctrl.Result{}, statusErr
 		}
-		_ = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
-			if current.Generation == cr.Generation && current.DeletionTimestamp.IsZero() && current.Status.LastPublishedRevision != "" {
-				condition(current, "GitDrift", metav1.ConditionUnknown, "AccessFailed", "Cannot compare the managed file with the published content.")
-			}
-		})
 		return ctrl.Result{}, err
 	}
 	if !cr.DeletionTimestamp.IsZero() {
 		if !result.Unowned {
-			if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
+			if err = patchStatus(ctx, r.Client, r.Reader, cr, "publisher", func(current *api.GitResource) {
 				if current.Status.Cleanup != nil {
 					current.Status.Cleanup.Revision = result.Revision
 					if current.Status.LastPublishedRevision == "" && result.Recovery != nil {
@@ -354,20 +358,6 @@ attempts:
 	if err = r.setStatus(ctx, cr, true, reason, "Desired manifest publication verified in Git.", result, hash); err != nil {
 		return ctrl.Result{}, err
 	}
-	if err = patchStatus(ctx, r.Client, r.Reader, cr, func(current *api.GitResource) {
-		if current.Generation != cr.Generation || current.Status.LastPublishedRevision != result.Revision {
-			return
-		}
-		status, why, msg := metav1.ConditionFalse, "InSync", "Managed file matches the last published content."
-		if result.Missing {
-			status, why, msg = metav1.ConditionTrue, "FileMissing", "Managed file is absent at branch HEAD."
-		} else if result.Hash != hash {
-			status, why, msg = metav1.ConditionTrue, "ExternalModification", "Branch HEAD differs from the last published content."
-		}
-		condition(current, "GitDrift", status, why, msg)
-	}); err != nil {
-		return ctrl.Result{}, err
-	}
 	if adopting(cr) {
 		cr.Status.LastPublishedRevision = result.Revision
 		if r.handoffVerified(ctx, cr, result.Revision, "managed") {
@@ -386,7 +376,7 @@ attempts:
 
 // Publication and observer writers merge only their fields against the latest API object.
 func (r *GitResourceReconciler) setStatus(ctx context.Context, processed *api.GitResource, published bool, reason, message string, result gitwriter.Result, hash string) error {
-	return patchStatus(ctx, r.Client, r.Reader, processed, func(current *api.GitResource) {
+	return patchStatus(ctx, r.Client, r.Reader, processed, "publisher", func(current *api.GitResource) {
 		if current.Status.ObservedGeneration > processed.Generation || current.Status.LastPublishedGeneration > processed.Generation {
 			return
 		}
@@ -405,6 +395,20 @@ func (r *GitResourceReconciler) setStatus(ctx context.Context, processed *api.Gi
 			why = previous.Reason
 		}
 		meta.SetStatusCondition(&current.Status.Conditions, metav1.Condition{Type: "Published", Status: status, Reason: why, Message: bounded(message), ObservedGeneration: processed.Generation})
+		if current.Generation == processed.Generation && current.DeletionTimestamp.IsZero() {
+			if published && result.Hash != "" {
+				status, why, message := metav1.ConditionFalse, "InSync", "Managed file matches the last published content."
+				if result.Missing {
+					status, why, message = metav1.ConditionTrue, "FileMissing", "Managed file is absent at branch HEAD."
+				} else if result.Hash != hash {
+					status, why, message = metav1.ConditionTrue, "ExternalModification", "Branch HEAD differs from the last published content."
+				}
+				condition(current, "GitDrift", status, why, message)
+			} else if current.Status.LastPublishedRevision != "" && reason != "PublishPending" && (!published || reason == "Unchanged") {
+				condition(current, "GitDrift", metav1.ConditionUnknown, "AccessFailed", "Cannot compare the managed file with the published content.")
+			}
+		}
+
 	})
 }
 func resourceReference(raw []byte) *api.ResourceReference {
@@ -466,4 +470,9 @@ func (r *GitResourceReconciler) SetupWithManager(mgr ctrl.Manager) error {
 		Watches(&api.ClusterGitConfig{}, handler.EnqueueRequestsFromMapFunc(r.affected), builder.WithPredicates(configPredicate)).
 		Watches(&corev1.Secret{}, handler.EnqueueRequestsFromMapFunc(r.affected)).
 		WithOptions(runtimecontroller.Options{MaxConcurrentReconciles: r.Workers}).Complete(r)
+}
+
+func publicationRetryDelay(attempt int) time.Duration {
+	delay := time.Duration(1<<min(attempt-1, 2)) * 500 * time.Millisecond
+	return delay/2 + time.Duration(rand.Int64N(int64(delay)))
 }

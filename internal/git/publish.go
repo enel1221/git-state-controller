@@ -29,6 +29,8 @@ var ErrCredentialsInvalid = errors.New("git authentication or authorization fail
 
 var ErrRetry = errors.New("remote publication not confirmed; retry from current branch")
 
+var ErrBranchChanged = fmt.Errorf("%w: remote branch advanced", ErrRetry)
+
 var ErrPathAlreadyExists = errors.New("PathAlreadyExists: existing file is not owned by this GitResource; explicit adoption required")
 var ErrRecoveryRequired = errors.New("RecoveryRequired: cannot verify the last owned publication")
 var ErrPaused = errors.New("reconciliation paused")
@@ -50,6 +52,7 @@ type Operation struct {
 	AllowAdopt, AllowLegacy, ReadOnly, Orphan bool
 	Guard                                     func(context.Context) error
 	Access                                    func(operation string, success bool)
+	FlushAccess                               func()
 }
 type Recovery struct {
 	Revision   string
@@ -72,17 +75,21 @@ type Publisher struct {
 	Push func(context.Context, *gogit.Repository, *gogit.PushOptions) error
 }
 
+func recordOperation(ctx context.Context, operation string, start time.Time, success bool) {
+	outcome := "succeeded"
+	if !success {
+		outcome = "failed"
+	}
+	duration := time.Since(start).Seconds()
+	gitDuration.WithLabelValues(operation, outcome).Observe(duration)
+	ctrl.LoggerFrom(ctx).Info("Git operation", "operation", operation, "outcome", outcome, "durationSeconds", duration)
+}
+
 func clone(ctx context.Context, op Operation) (*gogit.Repository, string, error) {
 	start := time.Now()
 	success := false
 	defer func() {
-		outcome := "failed"
-		if success {
-			outcome = "succeeded"
-		}
-		duration := time.Since(start).Seconds()
-		gitDuration.WithLabelValues("Fetch", outcome).Observe(duration)
-		ctrl.LoggerFrom(ctx).Info("Git operation", "operation", "Fetch", "outcome", outcome, "durationSeconds", duration)
+		recordOperation(ctx, "Clone", start, success)
 		if op.Access != nil {
 			op.Access("Fetch", success)
 		}
@@ -104,6 +111,38 @@ func clone(ctx context.Context, op Operation) (*gogit.Repository, string, error)
 	}
 	success = true
 	return repo, dir, nil
+}
+
+// refresh verifies remote state in the isolated worktree without a second clone.
+// The force refspec refreshes only our local tracking ref; pushes remain normal.
+func refresh(ctx context.Context, repo *gogit.Repository, op Operation) (err error) {
+	start := time.Now()
+	defer func() {
+		recordOperation(ctx, "Fetch", start, err == nil)
+		if op.Access != nil {
+			op.Access("Fetch", err == nil)
+		}
+	}()
+	ref := plumbing.ReferenceName("refs/remotes/origin/" + op.Branch)
+	err = repo.FetchContext(ctx, &gogit.FetchOptions{
+		RemoteName: "origin", RefSpecs: []config.RefSpec{config.RefSpec("+refs/heads/" + op.Branch + ":" + ref.String())},
+		Auth: &http.BasicAuth{Username: op.Credentials.Username, Password: op.Credentials.Password},
+	})
+	if errors.Is(err, transport.ErrAuthenticationRequired) || errors.Is(err, transport.ErrAuthorizationFailed) {
+		return ErrCredentialsInvalid
+	}
+	if err != nil && !errors.Is(err, gogit.NoErrAlreadyUpToDate) {
+		return errors.New("fetch failed; check repository, branch, credentials and connectivity")
+	}
+	remote, err := repo.Reference(ref, true)
+	if err != nil {
+		return err
+	}
+	work, err := repo.Worktree()
+	if err != nil {
+		return err
+	}
+	return work.Reset(&gogit.ResetOptions{Mode: gogit.HardReset, Commit: remote.Hash()})
 }
 
 // safeFile rejects symlinks in every existing component, even links pointing inside the tree.
@@ -185,6 +224,15 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		return Result{}, err
 	}
 	defer os.RemoveAll(dir)
+	if !op.ReadOnly {
+		if err := refresh(ctx, repo, op); err != nil {
+			return Result{}, err
+		}
+	}
+	baseHead, err := repo.Head()
+	if err != nil {
+		return Result{}, err
+	}
 	file, err := safeFile(dir, op.Path)
 	if err != nil {
 		return Result{}, err
@@ -292,22 +340,24 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 	} else {
 		pushErr = repo.PushContext(ctx, options)
 	}
-	outcome := "succeeded"
-	if pushErr != nil {
-		outcome = "failed"
-	}
-	duration := time.Since(start).Seconds()
-	gitDuration.WithLabelValues("Push", outcome).Observe(duration)
-	ctrl.LoggerFrom(ctx).Info("Git operation", "operation", "Push", "outcome", outcome, "durationSeconds", duration)
-	if op.Access != nil {
-		op.Access("Push", pushErr == nil)
-	}
-	verified, verifyDir, err := clone(ctx, op)
+	recordOperation(ctx, "Push", start, pushErr == nil)
+	branchChanged := pushErr != nil && strings.HasPrefix(pushErr.Error(), "non-fast-forward update: ")
+	defer func() {
+		if op.Access != nil && !branchChanged {
+			op.Access("Push", pushErr == nil)
+		}
+	}()
+	err = refresh(ctx, repo, op)
 	if err != nil {
+		if ctx.Err() != nil {
+			return Result{}, ctx.Err()
+		}
+		if errors.Is(err, ErrCredentialsInvalid) {
+			return Result{}, err
+		}
 		return Result{}, ErrRetry
 	}
-	defer os.RemoveAll(verifyDir)
-	equal, err = matches(verifyDir, op)
+	equal, err = matches(dir, op)
 	if err != nil {
 		return Result{}, err
 	}
@@ -315,14 +365,21 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		if errors.Is(pushErr, transport.ErrAuthenticationRequired) || errors.Is(pushErr, transport.ErrAuthorizationFailed) {
 			return Result{}, ErrCredentialsInvalid
 		}
-		rejectedPush.Inc()
-		ctrl.LoggerFrom(ctx).Info("Git push requires retry")
+		remoteHead, headErr := repo.Head()
+		if headErr != nil {
+			return Result{}, headErr
+		}
+		branchChanged = branchChanged || remoteHead.Hash() != baseHead.Hash()
+		if branchChanged {
+			rejectedPush.Inc()
+			ctrl.LoggerFrom(ctx).Info("Git push requires retry")
+			return Result{}, ErrBranchChanged
+		}
+		ctrl.LoggerFrom(ctx).Info("Git publication requires verification retry")
 		return Result{}, ErrRetry
 	}
-	if op.Access != nil {
-		op.Access("Push", true)
-	}
-	sha, err := revision(verified, op, false)
+	pushErr = nil // Remote content confirms success even after a lost acknowledgment.
+	sha, err := revision(repo, op, false)
 	return Result{Revision: sha, Changed: true, Hash: manifest.Hash(op.Content), Missing: op.Delete, Recovery: recovery}, err
 }
 

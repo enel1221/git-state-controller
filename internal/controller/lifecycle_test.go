@@ -342,6 +342,7 @@ func TestCredentialsEvidenceRotationAndPushDenial(t *testing.T) {
 	secret.Data["password"] = []byte("rotated")
 	_ = r.Update(ctx, secret)
 	op.Access("Push", true)
+	op.FlushAccess()
 	_ = r.Get(ctx, types.NamespacedName{Name: "default"}, config)
 	if config.Status.LastAccess.SecretResourceVersion != oldVersion {
 		t.Fatal("old operation certified rotated credentials")

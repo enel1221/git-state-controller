@@ -57,7 +57,7 @@ func TestRealStatusRoundTripAndConflict(t *testing.T) {
 	wrapped := interceptor.NewClient(c, interceptor.Funcs{SubResourcePatch: func(ctx context.Context, base client.Client, sub string, obj client.Object, p client.Patch, opts ...client.SubResourcePatchOption) error {
 		if first {
 			first = false
-			if err := patchStatus(ctx, base, c, original, func(current *api.GitResource) {
+			if err := patchStatus(ctx, base, c, original, "publisher", func(current *api.GitResource) {
 				current.Status.LastPublishedRevision = "0123456789012345678901234567890123456789"
 				current.Status.LastPublishedGeneration = current.Generation
 				current.Status.LastPublishedContentHash = "sha256:0123456789012345678901234567890123456789012345678901234567890123"
@@ -68,7 +68,7 @@ func TestRealStatusRoundTripAndConflict(t *testing.T) {
 		}
 		return base.Status().Patch(ctx, obj, p, opts...)
 	}})
-	if err := patchStatus(ctx, wrapped, c, original, func(current *api.GitResource) {
+	if err := patchStatus(ctx, wrapped, c, original, "publisher", func(current *api.GitResource) {
 		current.Status.ArgoCD = &api.ApplicationSnapshot{Observation: api.Observation{Reason: "Observed"}, Status: snapshot}
 		current.Status.Resource = &api.ResourceSnapshot{Ref: api.ResourceReference{APIVersion: "v1", Kind: "ConfigMap", Name: "target"}, Observation: api.Observation{Reason: "Observed"}, Status: rawJSON(map[string]interface{}{})}
 	}); err != nil {
@@ -84,14 +84,14 @@ func TestRealStatusRoundTripAndConflict(t *testing.T) {
 		t.Fatal("real status-only update enqueued publisher")
 	}
 	version := cr.ResourceVersion
-	if err := patchStatus(ctx, c, c, cr, func(*api.GitResource) {}); err != nil {
+	if err := patchStatus(ctx, c, c, cr, "publisher", func(*api.GitResource) {}); err != nil {
 		t.Fatal(err)
 	}
 	_ = c.Get(ctx, client.ObjectKeyFromObject(cr), cr)
 	if version != cr.ResourceVersion {
 		t.Fatal("real semantic no-op patched")
 	}
-	if err := patchStatus(ctx, c, c, cr, func(current *api.GitResource) {
+	if err := patchStatus(ctx, c, c, cr, "publisher", func(current *api.GitResource) {
 		current.Status.ArgoCD.Status = rawJSON(map[string]interface{}{"replacement": "only"})
 		current.Status.Resource.Status = nil
 	}); err != nil {

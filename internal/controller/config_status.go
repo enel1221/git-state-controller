@@ -48,8 +48,20 @@ func (r *GitResourceReconciler) loadConfig(ctx context.Context, name string) (*a
 	if err != nil || parsed.Address != email || strings.TrimSpace(nameAuthor) == "" || strings.ContainsAny(nameAuthor, "\r\n<>") {
 		return invalid(secret, "commit identity must have a usable name and email")
 	}
-	r.recordConfig(ctx, config, secret, true, "CredentialsLoaded", nil)
+	ready := meta.FindStatusCondition(config.Status.Conditions, "Ready")
+	if config.Status.ObservedGeneration != config.Generation || ready == nil || ready.Status != metav1.ConditionTrue || ready.ObservedGeneration != config.Generation || ready.Reason != "CredentialsLoaded" || !reflect.DeepEqual(config.Status.CredentialsRef, credentialReference(config, secret)) {
+		r.recordConfig(ctx, config, secret, true, "CredentialsLoaded", nil)
+	}
 	return config, secret, "", nil
+}
+
+func credentialReference(config *api.ClusterGitConfig, secret *corev1.Secret) *api.CredentialReference {
+	ref := &api.CredentialReference{Namespace: config.Spec.Credentials.SecretRef.Namespace, Name: config.Spec.Credentials.SecretRef.Name}
+	if secret != nil {
+		ref.UID = string(secret.UID)
+		ref.ResourceVersion = secret.ResourceVersion
+	}
+	return ref
 }
 
 // Evidence is tied to the configuration and Secret actually used, never a later rotation.
@@ -73,11 +85,7 @@ func (r *GitResourceReconciler) recordConfig(ctx context.Context, used *api.Clus
 		}
 		before := current.DeepCopy()
 		current.Status.ObservedGeneration = used.Generation
-		current.Status.CredentialsRef = &api.CredentialReference{Namespace: used.Spec.Credentials.SecretRef.Namespace, Name: used.Spec.Credentials.SecretRef.Name}
-		if secret != nil {
-			current.Status.CredentialsRef.UID = string(secret.UID)
-			current.Status.CredentialsRef.ResourceVersion = secret.ResourceVersion
-		}
+		current.Status.CredentialsRef = credentialReference(used, secret)
 		value, message := metav1.ConditionFalse, "Credentials could not be loaded; check Secret reference, keys and commit identity."
 		if loaded {
 			value, message = metav1.ConditionTrue, "Secret loaded; repository-specific access is reported separately."
@@ -98,7 +106,9 @@ func (r *GitResourceReconciler) recordConfig(ctx context.Context, used *api.Clus
 		if reflect.DeepEqual(before.Status, current.Status) {
 			return nil
 		}
-		return r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+		err := r.Status().Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+		statusPatchCounter.WithLabelValues("config", outcome(err)).Inc()
+		return err
 	})
 	if err != nil {
 		ctrl.LoggerFrom(ctx).Error(err, "Cannot record configuration diagnostics")
