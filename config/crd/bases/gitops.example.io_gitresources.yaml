@@ -52,6 +52,27 @@ spec:
             properties:
               change:
                 properties:
+                  action:
+                    enum:
+                    - Apply
+                    - Delete
+                    type: string
+                  author:
+                    properties:
+                      email:
+                        maxLength: 254
+                        minLength: 3
+                        pattern: ^[^<>\s@]+@[^<>\s@]+$
+                        type: string
+                      name:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[^<>\r\n]*[^<>\r\n\s][^<>\r\n]*$
+                        type: string
+                    required:
+                    - email
+                    - name
+                    type: object
                   message:
                     maxLength: 4096
                     type: string
@@ -131,6 +152,23 @@ spec:
                 - name
                 - namespace
                 type: object
+              approval:
+                properties:
+                  generation:
+                    format: int64
+                    type: integer
+                  operation:
+                    enum:
+                    - Apply
+                    - Adopt
+                    - Delete
+                    - Orphan
+                    type: string
+                  request:
+                    type: string
+                  required:
+                    type: boolean
+                type: object
               argoCD:
                 properties:
                   deletionTimestamp:
@@ -169,13 +207,68 @@ spec:
                 type: object
               cleanup:
                 properties:
+                  applicationUID:
+                    type: string
+                  author:
+                    properties:
+                      email:
+                        maxLength: 254
+                        minLength: 3
+                        pattern: ^[^<>\s@]+@[^<>\s@]+$
+                        type: string
+                      name:
+                        maxLength: 128
+                        minLength: 1
+                        pattern: ^[^<>\r\n]*[^<>\r\n\s][^<>\r\n]*$
+                        type: string
+                    required:
+                    - email
+                    - name
+                    type: object
+                  gitConfigRef:
+                    properties:
+                      kind:
+                        default: ClusterGitConfig
+                        enum:
+                        - ClusterGitConfig
+                        type: string
+                      name:
+                        default: default
+                        minLength: 1
+                        type: string
+                    type: object
+                  message:
+                    type: string
                   policy:
                     enum:
                     - Delete
                     - Orphan
                     type: string
+                  request:
+                    type: string
+                  resourceRef:
+                    properties:
+                      apiVersion:
+                        type: string
+                      kind:
+                        type: string
+                      name:
+                        type: string
+                      namespace:
+                        type: string
+                      uid:
+                        type: string
+                    required:
+                    - apiVersion
+                    - kind
+                    - name
+                    type: object
                   revision:
                     type: string
+                  unowned:
+                    description: Unowned is a verified never-owning cleanup with no
+                      inventory to remove.
+                    type: boolean
                 required:
                 - policy
                 type: object

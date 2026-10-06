@@ -71,6 +71,13 @@ up: ## Create/reuse the disposable stack and deploy the current controller.
 dev: ## Bootstrap and watch/build/load/deploy without teardown on Ctrl+C.
 	hack/dev-stack.sh dev
 
+.PHONY: ui
+ui: export PATH := $(CURDIR)/bin/node/bin:$(PATH)
+ui: check-stack ## Install dependencies, build and launch the local approval UI.
+	npm --prefix examples/approval-ui ci
+	npm --prefix examples/approval-ui run build
+	npm --prefix examples/approval-ui run dev
+
 clean: ## Delete only this checkout's dedicated cluster and local state.
 	hack/dev-stack.sh clean
 
@@ -78,7 +85,7 @@ check-stack:
 	hack/dev-stack.sh check
 
 test: check-stack ## Run every required suite; a missing live stack is an error.
-	$(MAKE) test-unit test-api test-e2e
+	$(MAKE) test-unit test-api test-e2e test-ui
 
 test-unit: generate manifests fmt vet ## Run deterministic, controller and real Git smart-HTTP tests.
 	go test -race ./internal/... ./cmd/... ./hack/bootstrap/... ./test/devstack/...
@@ -88,6 +95,10 @@ test-api: generate manifests setup-envtest ## Run real API admission, defaults, 
 
 test-e2e: check-stack ## Exercise publication, Argo handoff, outages, restart and redeployment.
 	KUBECONFIG="$(CURDIR)/.dev/kubeconfig" go test -tags=e2e ./test/e2e -v -timeout=30m || { hack/diagnostics.sh; exit 1; }
+
+.PHONY: test-ui
+test-ui: check-stack ## Build and test the optional demo, including its required real browser journey.
+	PATH="$(CURDIR)/bin/node/bin:$$PATH" hack/test-ui.sh
 
 diagnostics: ## Capture credential-free stack diagnostics in reports/.
 	hack/diagnostics.sh

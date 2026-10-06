@@ -73,7 +73,15 @@ A Git-only revert is an external branch change. Under v0.2's informational-drift
 
 ## Audit limits
 
-Commit trailers provide useful attribution to wrapper namespace/name, UID and generation. They are not proof of an authenticated human approver, a tamper-proof audit log, or approval evidence. Git history is not a promise of one commit for every rapid intermediate CR edit. Deletion removes the file from the branch's current tree, not from all previous commits.
+Commit trailers provide attribution to wrapper namespace/name, UID and generation.
+New controller commits also record `GitResource-Approval: Approved` with the
+request token and optional `Approved-by: Name <email>`, or
+`GitResource-Approval: NotRequired` for automatic operations. See
+[approvals.md](approvals.md) for the annotation format and consumption rules.
+Supplied names are not proof of an authenticated human approver or a tamper-proof
+audit log. No-op approvals do not create commits, and Git history is not a promise
+of one commit for every rapid intermediate CR edit. Deletion removes the file
+from the branch's current tree, not from all previous commits.
 
 An external audit service may correlate Git records with Kubernetes audit records and future approval records. Those integrations are explicitly outside this small example. The raw Argo status mirror may include Argo's own existing deployment history; that is not a substitute for path-scoped Git history and is not independently accumulated by our controller.
 

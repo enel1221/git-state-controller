@@ -1,6 +1,6 @@
 # Repository guide
 
-This example follows SPEC-v0.2.md, which supersedes SPEC.md. Keep production code under `internal/`, use go-git
+This example follows SPEC-v0.3.md, which supersedes SPEC-v0.2.md and SPEC.md. Keep production code under `internal/`, use go-git
 for Git operations, and keep Git publication independent of the ApplicationSet
 inventory reconciliation. The status observer uses no Git client and reads exact
 targets uncached. Do not add deferred platform features.
@@ -14,7 +14,8 @@ Use `make lint-fix` after Go edits and run the relevant checks:
 
 - `make test-unit`: race-enabled logic/controller/smart-HTTP Git and lifecycle tests.
 - `make test-api`: real envtest admission, defaults, status and finalizers.
-- `make test`: all required suites, including the existing managed k3d stack.
+- `make test`: all required suites, including the managed k3d stack and approval demo browser journey.
+- `make test-ui`: Node 24+, npm and Playwright Chromium must be installed; missing prerequisites are errors.
 
 E2E tests require the dedicated `git-state-dev` cluster created by `make up` or
 `make dev`. They deliberately disrupt Forgejo/Argo and temporarily add a new Go

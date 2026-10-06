@@ -11,6 +11,14 @@ rules:
   verbs:
   - get
 - apiGroups:
+  - ""
+  resources:
+  - namespaces
+  verbs:
+  - get
+  - list
+  - watch
+- apiGroups:
   - events.k8s.io
   resources:
   - events
@@ -39,6 +47,7 @@ rules:
   resources:
   - gitresources
   verbs:
+  - delete
   - get
   - list
   - patch

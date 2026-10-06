@@ -82,3 +82,20 @@ CR/repository/path/SHA/UID metric labels. Polling costs roughly N/15 exact targe
 GETs per second plus events. Full status/watch bandwidth scales with
 object size and churn; the one ApplicationSet list grows with active and retained
 entries. The example does not promise a hardware-independent scale threshold.
+
+## v0.3 approval and cleanup display
+
+The publisher owns `status.approval` and Approved. `required` is the last observed
+namespace policy, omitted on lookup/invalid-policy errors. Request/generation/operation
+describe a new mutation and are omitted when none remains. True/NoChanges does not
+claim human approval for a housekeeping generation. ApprovalPending/Mismatch keeps
+lastPublished fields and raw deployment mirrors, with Ready=False/ApprovalPending;
+unknown/invalid policy makes Ready Unknown. Pause has precedence.
+
+Accepted cleanup preserves its advertised context instead of asking again as status
+progresses. Ready uses the cleanup blocker; expected Application/target absence does
+not override it with an observer error. Exact uncached GETs continue from frozen
+references after the Application disappears. Terminating objects retain available
+raw status; authoritative absence clears payloads but retains diagnostic references.
+Deletion completion covers the Application and one direct target, not an independent
+inventory of every descendant or external cloud asset. See [approvals.md](approvals.md).

@@ -118,7 +118,7 @@ func TestV02(t *testing.T) {
 		if err != nil || !bytes.Equal(still, external) {
 			t.Fatal("drift was repaired")
 		}
-		s.edit(t, cr, func(c *api.GitResource) { c.Spec.Change.Message = "message only" })
+		s.edit(t, cr, func(c *api.GitResource) { c.Spec.Change = &api.Change{Message: "message only"} })
 		current = s.published(t, cr)
 		if current.Status.LastPublishedRevision != sha || !meta.IsStatusConditionTrue(current.Status.Conditions, "GitDrift") {
 			t.Fatal("message-only event advanced pin")

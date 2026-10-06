@@ -15,7 +15,7 @@ func mutationChanged(old, new client.Object) bool {
 	if old == nil || new == nil {
 		return true
 	}
-	return old.GetGeneration() != new.GetGeneration() || !old.GetDeletionTimestamp().Equal(new.GetDeletionTimestamp()) || old.GetAnnotations()[PausedAnnotation] != new.GetAnnotations()[PausedAnnotation] || old.GetAnnotations()[AdoptAnnotation] != new.GetAnnotations()[AdoptAnnotation]
+	return old.GetUID() != new.GetUID() || old.GetGeneration() != new.GetGeneration() || !old.GetDeletionTimestamp().Equal(new.GetDeletionTimestamp()) || old.GetAnnotations()[PausedAnnotation] != new.GetAnnotations()[PausedAnnotation] || old.GetAnnotations()[AdoptAnnotation] != new.GetAnnotations()[AdoptAnnotation] || old.GetAnnotations()[ApprovedRequestAnnotation] != new.GetAnnotations()[ApprovedRequestAnnotation] || old.GetAnnotations()[ApprovedByAnnotation] != new.GetAnnotations()[ApprovedByAnnotation]
 }
 
 var publisherPredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool { return mutationChanged(e.ObjectOld, e.ObjectNew) }}
@@ -72,4 +72,8 @@ var applicationPredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent)
 		}
 	}
 	return e.ObjectOld.GetLabels()["gitops.example.io/managed"] != e.ObjectNew.GetLabels()["gitops.example.io/managed"] || objectFieldChanged(e, "spec", "source") || objectFieldChanged(e, "spec", "sources") || objectFieldChanged(e, "spec", "destination") || objectFieldChanged(e, "status")
+}}
+
+var namespacePredicate = predicate.Funcs{UpdateFunc: func(e event.UpdateEvent) bool {
+	return identityChanged(e) || e.ObjectOld.GetAnnotations()[ApprovalPolicyAnnotation] != e.ObjectNew.GetAnnotations()[ApprovalPolicyAnnotation]
 }}

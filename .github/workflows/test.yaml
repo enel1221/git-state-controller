@@ -15,6 +15,14 @@ jobs:
       - uses: actions/setup-go@924ae3a1cded613372ab5595356fb5720e22ba16 # v6
         with:
           go-version: 1.26.8
+      - uses: actions/setup-node@249970729cb0ef3589644e2896645e5dc5ba9c38 # v6
+        with:
+          node-version: 24.21.0
+      - name: Install browser test prerequisites
+        run: |
+          npm ci --prefix examples/approval-ui
+          cd examples/approval-ui
+          npx playwright install --with-deps chromium
       - name: Install pinned project-local tools
         run: |
           hack/install-ci-tools.sh

@@ -37,8 +37,10 @@ func fixture(t *testing.T) (*testgit.Server, *GitResourceReconciler, *api.GitRes
 	cr := &api.GitResource{ObjectMeta: metav1.ObjectMeta{Name: "example", Namespace: "demo", UID: "original-uid", Generation: 1}, Spec: api.GitResourceSpec{Repository: api.Repository{URL: s.URL, Branch: "main", Path: "demo/example.yaml"}, Manifest: runtime.RawExtension{Raw: []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"example"},"data":{"greeting":"hello"}}`)}}}
 	config := &api.ClusterGitConfig{ObjectMeta: metav1.ObjectMeta{Name: "default"}, Spec: api.ClusterGitConfigSpec{Credentials: api.Credentials{Source: "Secret", SecretRef: api.SecretReference{Namespace: "git-state-system", Name: "writer"}}}}
 	secret := &corev1.Secret{ObjectMeta: metav1.ObjectMeta{Namespace: "git-state-system", Name: "writer"}, Data: map[string][]byte{"username": []byte("bot"), "password": []byte("password")}}
-	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.GitResource{}, &api.ClusterGitConfig{}).WithObjects(cr, config, secret).Build()
-	return s, &GitResourceReconciler{Client: c, Reader: c, Publisher: &writer.Publisher{}, Namespace: "git-state-system", AllowHTTP: true}, cr
+	c := fake.NewClientBuilder().WithScheme(scheme).WithStatusSubresource(&api.GitResource{}, &api.ClusterGitConfig{}).WithObjects(cr, config, secret, &corev1.Namespace{ObjectMeta: metav1.ObjectMeta{Name: "demo"}}).Build()
+	mapper := meta.NewDefaultRESTMapper([]schema.GroupVersion{corev1.SchemeGroupVersion})
+	mapper.Add(corev1.SchemeGroupVersion.WithKind("ConfigMap"), meta.RESTScopeNamespace)
+	return s, &GitResourceReconciler{Client: c, Reader: c, Mapper: mapper, Publisher: &writer.Publisher{}, Namespace: "git-state-system", AllowHTTP: true}, cr
 }
 func reconcileCR(t *testing.T, r *GitResourceReconciler, cr *api.GitResource) {
 	t.Helper()
@@ -70,7 +72,7 @@ func TestGenerationAndStatusConflict(t *testing.T) {
 	reconcileCR(t, r, cr)
 	current := &api.GitResource{}
 	_ = base.Get(context.Background(), key, current)
-	if current.Status.LastPublishedGeneration != 1 || current.Generation != 2 {
+	if current.Status.LastPublishedGeneration != 2 || current.Generation != 2 {
 		t.Fatal("older bytes mislabeled", current)
 	}
 	if conflicts != 1 || s.Count(t) != 2 {
@@ -87,7 +89,7 @@ func TestGenerationAndStatusConflict(t *testing.T) {
 	if s.Count(t) != count {
 		t.Fatal("duplicate metadata/no-op commit")
 	}
-	current.Spec.Change.Message = "new message"
+	current.Spec.Change = &api.Change{Message: "new message"}
 	current.Generation = 3
 	_ = base.Update(context.Background(), current)
 	reconcileCR(t, r, cr)

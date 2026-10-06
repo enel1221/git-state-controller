@@ -46,8 +46,11 @@ type Operation struct {
 	Delete                                    bool
 	Credentials                               Credentials
 	AuthorName, AuthorEmail, Message          string
+	CommitterName, CommitterEmail             string
 	PreviousRevision                          string
 	PreviousHash                              string
+	Generation                                int64
+	RecoverOnly                               bool
 	OwnerUID, SourceNamespace, SourceName     string
 	AllowAdopt, AllowLegacy, ReadOnly, Orphan bool
 	Guard                                     func(context.Context) error
@@ -224,7 +227,7 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 		return Result{}, err
 	}
 	defer os.RemoveAll(dir)
-	if !op.ReadOnly {
+	if !op.ReadOnly && !op.RecoverOnly {
 		if err := refresh(ctx, repo, op); err != nil {
 			return Result{}, err
 		}
@@ -242,6 +245,18 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 	if readErr != nil && !missing {
 		return Result{}, readErr
 	}
+	if op.RecoverOnly {
+		if op.PreviousRevision != "" && manifest.Hash(op.Content) == op.PreviousHash {
+			return Result{Revision: op.PreviousRevision, Hash: manifest.Hash(content), Missing: missing}, nil
+		}
+		previous := op
+		previous.PreviousRevision = ""
+		published, sha, generation, err := recoverPublished(repo, previous)
+		if err != nil || generation <= 0 || generation > op.Generation || manifest.Hash(published) != manifest.Hash(op.Content) {
+			return Result{}, ErrRecoveryRequired
+		}
+		return Result{Revision: sha, Hash: manifest.Hash(content), Missing: missing}, nil
+	}
 	if op.ReadOnly {
 		return Result{Revision: op.PreviousRevision, Hash: manifest.Hash(content), Missing: missing}, nil
 	}
@@ -258,20 +273,25 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 	}
 	if op.OwnerUID != "" && !missing && owner != op.OwnerUID && !legacy && !op.AllowAdopt {
 		if op.Orphan && op.PreviousRevision == "" {
-			return Result{Unowned: true}, nil
+			return Result{Unowned: true, Revision: baseHead.Hash().String()}, nil
 		}
 		if op.Delete {
 			if owner != "" || op.PreviousRevision == "" {
-				return Result{Unowned: true}, nil
+				return Result{Unowned: true, Revision: baseHead.Hash().String()}, nil
 			}
 			return Result{}, ErrRecoveryRequired
 		}
 		return Result{}, ErrPathAlreadyExists
 	}
 	var recovery *Recovery
+	if op.Delete && op.PreviousRevision == "" {
+		if content, sha, generation, err := recoverPublished(repo, op); err == nil {
+			recovery = &Recovery{Revision: sha, Content: content, Generation: generation}
+		}
+	}
 	if op.Orphan {
 		if missing && op.PreviousRevision == "" {
-			return Result{Unowned: true}, nil
+			return Result{Unowned: true, Revision: baseHead.Hash().String()}, nil
 		}
 		published, recoveredSHA, generation, e := recoverPublished(repo, op)
 		if e != nil {
@@ -320,7 +340,11 @@ func (p *Publisher) Attempt(ctx context.Context, op Operation) (Result, error) {
 			return Result{}, errors.New("stage file failed")
 		}
 	}
-	_, err = work.Commit(op.Message, &gogit.CommitOptions{Author: &object.Signature{Name: op.AuthorName, Email: op.AuthorEmail, When: time.Now()}})
+	committer := &object.Signature{Name: op.CommitterName, Email: op.CommitterEmail, When: time.Now()}
+	if committer.Name == "" && committer.Email == "" {
+		committer.Name, committer.Email = op.AuthorName, op.AuthorEmail
+	}
+	_, err = work.Commit(op.Message, &gogit.CommitOptions{Author: &object.Signature{Name: op.AuthorName, Email: op.AuthorEmail, When: time.Now()}, Committer: committer})
 	if err != nil {
 		return Result{}, errors.New("commit failed")
 	}
@@ -400,7 +424,9 @@ func commitGeneration(repo *gogit.Repository, sha string) int64 {
 	if err != nil {
 		return 0
 	}
-	for _, line := range strings.Split(commit.Message, "\n") {
+	lines := strings.Split(commit.Message, "\n")
+	for i := len(lines) - 1; i >= 0; i-- {
+		line := lines[i]
 		if strings.HasPrefix(line, "GitResource-Generation: ") {
 			n, _ := strconv.ParseInt(strings.TrimPrefix(line, "GitResource-Generation: "), 10, 64)
 			return n

@@ -89,7 +89,7 @@ func TestPauseDriftAndCollision(t *testing.T) {
 	if s.Count(t) != count || cr.Status.LastPublishedRevision != sha || !meta.IsStatusConditionTrue(cr.Status.Conditions, "GitDrift") {
 		t.Fatal("drift repaired or pin advanced")
 	}
-	cr.Spec.Change.Message = "message only"
+	cr.Spec.Change = &api.Change{Message: "message only"}
 	cr.Generation++
 	_ = r.Update(context.Background(), cr)
 	reconcileCR(t, r, cr)

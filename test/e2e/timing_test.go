@@ -30,14 +30,14 @@ import (
 )
 
 type caseTiming struct {
-	StatusWrites                                 int
-	GitOperations                                []map[string]interface{}
-	RejectedPushRetries                          int
-	Name                                         string `json:"name"`
-	CreateStarted, CreatePublished, CreateSynced time.Time
-	UpdateStarted, UpdatePublished, UpdateSynced time.Time
-	DeleteStarted, CRRemoved, DownstreamDeleted  time.Time
-	ApplicationBytes, ResourceBytes              int
+	StatusWrites                                            int
+	GitOperations                                           []map[string]interface{}
+	RejectedPushRetries                                     int
+	Name                                                    string `json:"name"`
+	CreateStarted, CreatePublished, CreateSynced            time.Time
+	UpdateStarted, UpdatePublished, UpdateSynced            time.Time
+	DeleteStarted, GitRemoved, CRRemoved, DownstreamDeleted time.Time
+	ApplicationBytes, ResourceBytes                         int
 }
 
 func distribution(values []float64) map[string]interface{} {
@@ -165,6 +165,7 @@ func (s *stack) measureTwenty(t *testing.T) {
 		}
 	}()
 	writes := map[string]int{}
+	cleanupTimes := map[string]time.Time{}
 	previous := map[string][]byte{}
 	var mu sync.Mutex
 	done := make(chan struct{})
@@ -184,6 +185,9 @@ func (s *stack) measureTwenty(t *testing.T) {
 			mu.Lock()
 			if !bytes.Equal(previous[cr.Name], raw) && string(raw) != "{}" {
 				writes[cr.Name]++
+			}
+			if cr.Status.Cleanup != nil && cr.Status.Cleanup.Revision != "" && cleanupTimes[cr.Name].IsZero() {
+				cleanupTimes[cr.Name] = time.Now()
 			}
 			previous[cr.Name] = raw
 			mu.Unlock()
@@ -308,6 +312,7 @@ func (s *stack) measureTwenty(t *testing.T) {
 	mu.Lock()
 	for name, timing := range cases {
 		timing.StatusWrites = writes[name]
+		timing.GitRemoved = cleanupTimes[name]
 	}
 	mu.Unlock()
 	raw := []*caseTiming{}
@@ -320,6 +325,8 @@ func (s *stack) measureTwenty(t *testing.T) {
 		measurements["publication_to_observed_sync_seconds"] = append(measurements["publication_to_observed_sync_seconds"], v.CreateSynced.Sub(v.CreatePublished).Seconds())
 		measurements["update_to_publication_seconds"] = append(measurements["update_to_publication_seconds"], v.UpdatePublished.Sub(v.UpdateStarted).Seconds())
 		measurements["updated_publication_to_observed_sync_seconds"] = append(measurements["updated_publication_to_observed_sync_seconds"], v.UpdateSynced.Sub(v.UpdatePublished).Seconds())
+		measurements["delete_to_git_cleanup_seconds"] = append(measurements["delete_to_git_cleanup_seconds"], v.GitRemoved.Sub(v.DeleteStarted).Seconds())
+		measurements["git_cleanup_to_cr_removal_seconds"] = append(measurements["git_cleanup_to_cr_removal_seconds"], v.CRRemoved.Sub(v.GitRemoved).Seconds())
 		measurements["delete_to_cr_removal_seconds"] = append(measurements["delete_to_cr_removal_seconds"], v.CRRemoved.Sub(v.DeleteStarted).Seconds())
 		measurements["cr_removal_to_downstream_deletion_seconds"] = append(measurements["cr_removal_to_downstream_deletion_seconds"], v.DownstreamDeleted.Sub(v.CRRemoved).Seconds())
 		if v.CreatePublished.After(lastPublication) {

@@ -31,10 +31,26 @@ type Repository struct {
 	Path string `json:"path"`
 }
 
+type ChangeAuthor struct {
+	// +kubebuilder:validation:MinLength=1
+	// +kubebuilder:validation:MaxLength=128
+	// +kubebuilder:validation:Pattern=`^[^<>\r\n]*[^<>\r\n\s][^<>\r\n]*$`
+	Name string `json:"name"`
+	// +kubebuilder:validation:MinLength=3
+	// +kubebuilder:validation:MaxLength=254
+	// +kubebuilder:validation:Pattern=`^[^<>\s@]+@[^<>\s@]+$`
+	Email string `json:"email"`
+}
+
 type Change struct {
 	// +optional
 	// +kubebuilder:validation:MaxLength=4096
 	Message string `json:"message,omitempty"`
+	// +optional
+	Author *ChangeAuthor `json:"author,omitempty"`
+	// +optional
+	// +kubebuilder:validation:Enum=Apply;Delete
+	Action string `json:"action,omitempty"`
 }
 
 type GitResourceSpec struct {
@@ -43,7 +59,7 @@ type GitResourceSpec struct {
 	GitConfigRef GitConfigReference `json:"gitConfigRef,omitempty"`
 	Repository   Repository         `json:"repository"`
 	// +optional
-	Change Change `json:"change,omitempty"`
+	Change *Change `json:"change,omitempty"`
 	// +optional
 	// +kubebuilder:default=Delete
 	// +kubebuilder:validation:Enum=Delete;Orphan
@@ -67,6 +83,7 @@ type GitResourceStatus struct {
 	ArgoCD                   *ApplicationSnapshot  `json:"argoCD,omitempty"`
 	Resource                 *ResourceSnapshot     `json:"resource,omitempty"`
 	Cleanup                  *CleanupCheckpoint    `json:"cleanup,omitempty"`
+	Approval                 *ApprovalStatus       `json:"approval,omitempty"`
 	// +listType=map
 	// +listMapKey=type
 	Conditions []metav1.Condition `json:"conditions,omitempty"`
@@ -117,10 +134,26 @@ type ResourceSnapshot struct {
 	// +kubebuilder:pruning:PreserveUnknownFields
 	Status *apiextensionsv1.JSON `json:"status,omitempty"`
 }
+type ApprovalStatus struct {
+	Required   *bool  `json:"required,omitempty"`
+	Generation *int64 `json:"generation,omitempty"`
+	// +kubebuilder:validation:Enum=Apply;Adopt;Delete;Orphan
+	Operation string `json:"operation,omitempty"`
+	Request   string `json:"request,omitempty"`
+}
+
 type CleanupCheckpoint struct {
 	// +kubebuilder:validation:Enum=Delete;Orphan
-	Policy   string `json:"policy"`
-	Revision string `json:"revision,omitempty"`
+	Policy         string              `json:"policy"`
+	Revision       string              `json:"revision,omitempty"`
+	Request        string              `json:"request,omitempty"`
+	GitConfigRef   *GitConfigReference `json:"gitConfigRef,omitempty"`
+	Author         *ChangeAuthor       `json:"author,omitempty"`
+	Message        string              `json:"message,omitempty"`
+	ApplicationUID string              `json:"applicationUID,omitempty"`
+	ResourceRef    *ResourceReference  `json:"resourceRef,omitempty"`
+	// Unowned is a verified never-owning cleanup with no inventory to remove.
+	Unowned bool `json:"unowned,omitempty"`
 }
 
 // +kubebuilder:object:root=true

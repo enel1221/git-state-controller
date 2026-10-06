@@ -39,10 +39,13 @@ is preserved exactly. Kubernetes observations continue and Ready reports
 ReconcilePaused. Already completed in-flight external success may be recorded;
 pause is not a distributed transaction cancelling a push already accepted.
 
-Delete is the default deletion policy. The worker confirms ownership, removes only
-its file, verifies remote absence and releases the wrapper without waiting for
-Argo. The aggregate removes the normal entry after the CR disappears. Argo later
-cascades deletion. A rejected, never-owning wrapper never deletes the other owner's
+Delete is the default deletion policy. v0.3 gates cleanup by namespace approval,
+then freezes policy, request, effective attribution, configuration and observed
+Application/published-target identities before starting. It removes only its Git
+file and saves the verified cleanup revision. The aggregate excludes that Delete
+entry while the wrapper is still terminating. Argo cascades Application/workload
+deletion; only verified entry, Application and exact direct-resource absence allow
+finalizer release. This intentionally replaces v0.2's early finalizer release. A rejected, never-owning wrapper never deletes the other owner's
 file. Unavailable or ambiguous ownership holds cleanup rather than guessing.
 
 For retention, set Orphan before deletion:
@@ -100,3 +103,31 @@ Ambiguous markerless paths require adopt-existing; no arbitrary file is claimed.
 
 See [status.md](status.md) for errors/readiness and [git-history.md](git-history.md)
 for path history and why a Git-only revert does not advance a pinned Application.
+
+## Prepared deletion and recovery in v0.3
+
+Submit `spec.change.action: Delete` with optional author/message and Delete/Orphan
+policy. The controller waits for approval, saves accepted context, then issues a
+UID/resourceVersion-preconditioned Kubernetes DELETE. Removing the prepared block
+can cancel it before Kubernetes accepts DELETE; after deletionTimestamp it cannot
+be canceled. Raw DELETE uses the same gate, with bot/default attribution unless
+explicit Delete metadata is present. A prior Apply approval/author is not reused.
+
+A terminating wrapper remains visible through Git/Argo outages, unreadable targets
+or blocked workload finalizers. Ready reports Deleting, WaitingForApplicationDeletion,
+WaitingForResourceDeletion, Orphaning or IdentityConflict with the actual blocker.
+Reads use frozen references after Application inventory disappears. Forbidden,
+discovery failures and read errors do not prove absence. A same-name replacement
+holds cleanup for operator recovery. The controller never deletes the workload,
+strips its finalizers or times out its own guarantee.
+
+Once accepted, cleanup resumes its stored context through restart or policy/spec
+changes; pause still blocks new effects. A preexisting v0.2 cleanup checkpoint is
+an already-started operation and is completed without retroactive approval, under
+the new downstream checks. Old tests/automation must allow these longer waits.
+Orphan still requires verified retention, not disappearance of retained objects.
+
+Manual finalizer removal bypasses the guarantee and is an operator recovery action
+only after verifying external cleanup. Namespace/cluster destruction is outside
+this per-wrapper contract. `make clean` still removes only the disposable stack.
+See [approvals.md](approvals.md) for policy, one-shot metadata and trusted evidence.

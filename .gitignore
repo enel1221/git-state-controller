@@ -32,3 +32,8 @@ go.work
 .dev/
 reports/
 dist/
+
+# Optional local approval demo
+node_modules/
+playwright-report/
+test-results/

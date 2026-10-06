@@ -117,6 +117,12 @@ func newStack(t *testing.T) *stack {
 	t.Cleanup(func() {
 		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Minute)
 		defer cancel()
+		namespace := &corev1.Namespace{}
+		if c.Get(ctx, client.ObjectKey{Name: s.namespace}, namespace) == nil && namespace.Annotations[controller.ApprovalPolicyAnnotation] != "" {
+			before := namespace.DeepCopy()
+			namespace.Annotations[controller.ApprovalPolicyAnnotation] = "false"
+			_ = c.Patch(ctx, namespace, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
+		}
 		resources := &api.GitResourceList{}
 		if err := c.List(ctx, resources, client.InNamespace(s.namespace)); err == nil {
 			for i := range resources.Items {
@@ -337,7 +343,7 @@ func TestManagedStack(t *testing.T) {
 		s.application(t, one)
 		sha := one.Status.LastPublishedRevision
 		s.edit(t, one, func(cr *api.GitResource) { cr.Labels = map[string]string{"only": "metadata"} })
-		s.edit(t, one, func(cr *api.GitResource) { cr.Spec.Change.Message = "message only" })
+		s.edit(t, one, func(cr *api.GitResource) { cr.Spec.Change = &api.Change{Message: "message only"} })
 		one = s.published(t, one)
 		if one.Status.LastPublishedRevision != sha {
 			t.Fatal("no-op changed SHA")
@@ -353,7 +359,7 @@ func TestManagedStack(t *testing.T) {
 	t.Run("unknown-fields-and-immutable-destination", func(t *testing.T) {
 		cr := s.create(t, "unknown")
 		s.edit(t, cr, func(cr *api.GitResource) {
-			cr.Spec.Manifest.Raw = []byte(`{"apiVersion":"future.example/v1","kind":"XR","metadata":{"name":"uninstalled"},"spec":{"arbitrary":{"list":[1,true,{"hello":"world"}]}},"status":{"drop":"yes"}}`)
+			cr.Spec.Manifest.Raw = []byte(`{"apiVersion":"v1","kind":"ConfigMap","metadata":{"name":"unknown"},"data":{"value":"opaque"},"arbitrary":{"list":[1,true,{"hello":"world"}]},"status":{"drop":"yes"}}`)
 		})
 		cr = s.published(t, cr)
 		s.assertFile(t, cr)
@@ -375,22 +381,7 @@ func TestManagedStack(t *testing.T) {
 			t.Fatal(err)
 		}
 		s.deleted(t, cr)
-		// The intentionally uninstalled XR cannot be applied or discovered for
-		// pruning. Remove only this failed fixture Application's finalizer after
-		// the inventory has requested deletion; no target object was created.
-		poll(t, "uninstalled-kind Application cleanup", func(ctx context.Context) bool {
-			app := appObject()
-			err := s.Get(ctx, types.NamespacedName{Namespace: "argocd", Name: controller.ApplicationName(cr)}, app)
-			if apierrors.IsNotFound(err) {
-				return true
-			}
-			if err != nil || app.GetDeletionTimestamp().IsZero() {
-				return false
-			}
-			before := app.DeepCopy()
-			app.SetFinalizers(nil)
-			return s.Patch(ctx, app, client.MergeFrom(before)) == nil
-		})
+		s.downstreamDeleted(t, cr)
 	})
 	t.Run("twenty-concurrent-publications", func(t *testing.T) { s.measureTwenty(t) })
 	t.Run("alternate-configuration-failure-and-recovery", func(t *testing.T) {
@@ -617,7 +608,10 @@ func TestManagedStack(t *testing.T) {
 		if err := s.Delete(context.Background(), two); err != nil {
 			t.Fatal(err)
 		}
-		s.deleted(t, two)
+		poll(t, "Git cleanup while Argo is stopped", func(ctx context.Context) bool {
+			current := &api.GitResource{}
+			return s.Get(ctx, client.ObjectKeyFromObject(two), current) == nil && current.Status.Cleanup != nil && current.Status.Cleanup.Revision != ""
+		})
 		s.command(t, "kubectl", "--kubeconfig", filepath.Join(s.root, ".dev/kubeconfig"), "--context", "k3d-git-state-dev", "rollout", "restart", "-n", "git-state-system", "deployment/controller-manager")
 		s.command(t, "kubectl", "--kubeconfig", filepath.Join(s.root, ".dev/kubeconfig"), "--context", "k3d-git-state-dev", "rollout", "status", "-n", "git-state-system", "deployment/controller-manager", "--timeout=180s")
 		poll(t, "inventory removal after restart", func(ctx context.Context) bool {
@@ -632,6 +626,7 @@ func TestManagedStack(t *testing.T) {
 		s.scale(t, "argocd", "deployment", "argocd-applicationset-controller", 1)
 		s.scale(t, "argocd", "statefulset", "argocd-application-controller", 1)
 		restored = true
+		s.deleted(t, two)
 		s.downstreamDeleted(t, two)
 	})
 }

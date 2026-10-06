@@ -66,8 +66,8 @@ func PublicationElements(resources []api.GitResource) []interface{} {
 	elements := []interface{}{}
 	for i := range resources {
 		cr := &resources[i]
-		// Keep last success through failed updates and finalization. Only absence removes an entry.
-		if cr.Status.LastPublishedRevision == "" || cr.Status.LastPublishedGeneration == 0 {
+		// Keep last success while approval/Git cleanup is pending. Verified Delete removes the entry before finalization.
+		if deleteGitComplete(cr) || cr.Status.LastPublishedRevision == "" || cr.Status.LastPublishedGeneration == 0 {
 			continue
 		}
 		elements = append(elements, map[string]interface{}{
@@ -246,4 +246,8 @@ func retainedElements(resources []api.GitResource, raw interface{}) []interface{
 		elements = append(elements, result[name])
 	}
 	return elements
+}
+
+func deleteGitComplete(cr *api.GitResource) bool {
+	return !cr.DeletionTimestamp.IsZero() && cr.Status.Cleanup != nil && cr.Status.Cleanup.Policy == "Delete" && cr.Status.Cleanup.Revision != ""
 }

@@ -162,11 +162,27 @@ func readyDecision(cr *api.GitResource, synced metav1.ConditionStatus, reason, m
 	if paused(cr) {
 		return metav1.ConditionFalse, "ReconcilePaused", "Mutations are paused; existing deployment and observations continue."
 	}
-	if !cr.DeletionTimestamp.IsZero() {
+	approval := meta.FindStatusCondition(cr.Status.Conditions, "Approved")
+	if approval != nil && approval.ObservedGeneration == cr.Generation && approval.Status != metav1.ConditionTrue {
+		reason := approval.Reason
+		if approval.Status == metav1.ConditionFalse {
+			reason = "ApprovalPending"
+		}
+		return approval.Status, reason, approval.Message
+	}
+	if deletionRequested(cr) {
 		p := meta.FindStatusCondition(cr.Status.Conditions, "Published")
 		msg := "Cleanup is pending."
-		if p != nil && p.Reason == "DeleteFailed" {
-			msg = p.Message
+		if p != nil {
+			if p.Reason == "WaitingForApplicationDeletion" || p.Reason == "WaitingForResourceDeletion" || p.Reason == "IdentityConflict" || p.Reason == "Orphaning" {
+				return metav1.ConditionFalse, p.Reason, p.Message
+			}
+			if p.Reason == "DeleteFailed" || p.Reason == "Deleting" {
+				msg = p.Message
+			}
+		}
+		if effectiveOperation(cr) == "Orphan" {
+			return metav1.ConditionFalse, "Orphaning", msg
 		}
 		return metav1.ConditionFalse, "Deleting", msg
 	}

@@ -6,7 +6,7 @@ to a shared Argo CD ApplicationSet. Each resource gets its own Application and
 literal file filter. Git cleanup uses a finalizer; Argo cleanup follows
 asynchronously after the CR disappears.
 
-The implementation follows [SPEC.md](SPEC.md). It uses the Kubebuilder v4.16.0
+The implementation follows [SPEC-v0.3.md](SPEC-v0.3.md). It uses the Kubebuilder v4.16.0
 Go scaffold, go-git v5.19.3, and controller-runtime v0.25.0. There is no webhook,
 Crossplane dependency, external database, Git hosting account, or registry push.
 
@@ -90,7 +90,7 @@ Run `make` or `make help` to list available commands and their descriptions.
 ```sh
 make up       # bootstrap dependencies, build/load/deploy, wait, return
 make dev      # same bootstrap, then watch/build/load/deploy/log
-make test     # unit + real API + live-stack E2E; every suite is required
+make test     # unit + real API + live-stack E2E + UI; every suite is required
 make clean    # delete the owned disposable cluster and local state
 ```
 
@@ -198,7 +198,7 @@ kinds. Publication itself does not require those CRDs.
 ## Tests and diagnostics
 
 `make test` requires the existing managed stack. Missing prerequisites, assets,
-cluster, or failed suites return nonzero. For independent development use
+cluster, Node/npm/Chromium, or failed suites return nonzero. For independent development use
 `make test-unit`, `make test-api`, `make generate manifests`, `make fmt vet`, and
 `make lint`. Production Git code never executes the Git CLI; the fast Git tests
 use a real authenticated HTTP server backed by `git http-backend`.
@@ -207,7 +207,9 @@ The live suite exercises two isolated Applications (also with a shared directory
 manifest and message-only updates, rapid revisions, unknown fields, destination
 immutability, alternate configuration and credential recovery, twenty concurrent
 publications, handoff failure, repeated `up`, a real `dev` rebuild, Git outage
-during deletion, and Argo outage/restart cleanup. A narrow test seam covers forced
+during deletion, and Argo outage/restart cleanup. v0.3 adds request-bound approvals,
+attribution/consumption, held-target cleanup through restart, and the required
+real Chromium create/update/delete journey. A narrow test seam covers forced
 branch races and uncertain push/status acknowledgment in fast tests.
 
 E2E deliberately scales the disposable Forgejo/Argo deployments and changes
@@ -269,6 +271,37 @@ and status-patch counts. These are measurements from that run with one-second
 polling overhead, not scale guarantees. The manager's private metrics endpoint
 is port 8080 and uses low-cardinality labels.
 
-Tested versions and measurements are recorded in [docs/verification.md](docs/verification.md).
+Current validation and measurements are in [docs/verification-v03.md](docs/verification-v03.md);
+[docs/verification.md](docs/verification.md) preserves the v0.2 results.
 The measured status and Git retry improvements, including seven compared strategies,
 are in [docs/optimization.md](docs/optimization.md).
+
+## v0.3 approvals and attribution
+
+Optional `spec.change.author` overrides the Git author for one completed Apply;
+the configured bot remains the committer. The block is safely consumed and never
+becomes the next edit's default. Namespace `gitops.example.io/approval-required`
+gates Apply/Adopt/Delete/Orphan using one UID/generation/operation-bound annotation.
+Pending proposals preserve the prior deployment.
+
+Approval commits record the request in their Git footer. The UI accepts an
+optional approver name/email, stored as request-bound `gitops.example.io/approved-by`
+JSON and emitted as `Approved-by: Name <email>`. This is supplied attribution;
+the Git author and bot committer retain their separate roles. Automatic commits
+record `GitResource-Approval: NotRequired`.
+
+Use `spec.change.action: Delete` for prepared deletion, or ordinary Kubernetes
+DELETE. Delete now retains the wrapper until Git, ApplicationSet, Application and
+direct-resource cleanup are verified. Orphan retains the deployment as before.
+Install matching v0.3 CRDs/controller before enabling policy. Namespaces without
+policy retain automatic flow; existing names/pins are preserved.
+
+See [docs/approvals.md](docs/approvals.md) for the trusted contract and
+[examples/approval-ui/README.md](examples/approval-ui/README.md) for the optional
+local Vite client and walkthrough. Node 24.19+, npm and Playwright Chromium are
+additional prerequisites for the required `make test-ui` part of `make test`.
+
+Run `make ui` after `make up` to install UI dependencies, build it, and launch
+the local demo at http://127.0.0.1:5173. Ctrl+C stops its UI/proxy processes.
+The four-command controller workflow remains unchanged. No new Git authentication,
+approval service, request CRD, database or signing keys are introduced.

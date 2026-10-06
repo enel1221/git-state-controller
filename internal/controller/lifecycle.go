@@ -22,9 +22,10 @@ func (r *GitResourceReconciler) setKey() types.NamespacedName {
 func (r *GitResourceReconciler) publicationIdentity(ctx context.Context, cr *api.GitResource) (api.ApplicationReference, bool, error) {
 	key := r.setKey()
 	ref := applicationRef(cr, key.Namespace)
+	adopt := adopting(cr) && !deletionRequested(cr)
 	set := ApplicationSetObject()
 	if err := r.Reader.Get(ctx, key, set); err != nil {
-		if adopting(cr) {
+		if adopt {
 			return ref, false, errors.New("cannot resolve adoption identity from ApplicationSet")
 		}
 		return ref, false, nil
@@ -44,9 +45,9 @@ func (r *GitResourceReconciler) publicationIdentity(ctx context.Context, cr *api
 			}
 		}
 	}
-	if !adopting(cr) {
+	if !adopt {
 		for _, e := range matches {
-			if stringField(e, "managementState") == "orphaned" && stringField(e, "uid") != string(cr.UID) {
+			if !deletionRequested(cr) && stringField(e, "managementState") == "orphaned" && stringField(e, "uid") != string(cr.UID) {
 				return ref, false, gitwriter.ErrPathAlreadyExists
 			}
 		}
@@ -104,24 +105,6 @@ func (r *GitResourceReconciler) handoffVerified(ctx context.Context, cr *api.Git
 	}
 	return count == 1
 }
-func (r *GitResourceReconciler) consumeAdoption(ctx context.Context, cr *api.GitResource) error {
-	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
-		current := &api.GitResource{}
-		if err := r.Reader.Get(ctx, client.ObjectKeyFromObject(cr), current); err != nil {
-			return client.IgnoreNotFound(err)
-		}
-		if current.UID != cr.UID || paused(current) || current.Generation != cr.Generation || !adopting(current) {
-			return nil
-		}
-		if !r.handoffVerified(ctx, current, current.Status.LastPublishedRevision, "managed") {
-			return nil
-		}
-		before := current.DeepCopy()
-		delete(current.Annotations, AdoptAnnotation)
-		return r.Patch(ctx, current, client.MergeFromWithOptions(before, client.MergeFromWithOptimisticLock{}))
-	})
-}
-
 func (r *GitResourceReconciler) releaseFinalizer(ctx context.Context, processed *api.GitResource) error {
 	return retry.RetryOnConflict(retry.DefaultBackoff, func() error {
 		current := &api.GitResource{}
@@ -131,7 +114,7 @@ func (r *GitResourceReconciler) releaseFinalizer(ctx context.Context, processed 
 		if current.UID != processed.UID || paused(current) {
 			return nil
 		}
-		if cleanup := current.Status.Cleanup; cleanup != nil && cleanup.Policy == "Orphan" && cleanup.Revision != "" && !r.handoffVerified(ctx, current, cleanup.Revision, "orphaned") {
+		if cleanup := current.Status.Cleanup; cleanup != nil && cleanup.Policy == "Orphan" && !cleanup.Unowned && cleanup.Revision != "" && !r.handoffVerified(ctx, current, cleanup.Revision, "orphaned") {
 			return nil
 		}
 		before := current.DeepCopy()

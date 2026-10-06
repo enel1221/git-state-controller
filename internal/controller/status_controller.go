@@ -148,6 +148,9 @@ func (r *StatusReconciler) tracked(ctx context.Context, cr *api.GitResource, app
 	return false
 }
 func (r *StatusReconciler) Observe(ctx context.Context, cr *api.GitResource) (*api.ApplicationSnapshot, *api.ResourceSnapshot) {
+	if !cr.DeletionTimestamp.IsZero() && cr.Status.Cleanup != nil {
+		return r.observeCleanup(ctx, cr)
+	}
 	now := metav1.Now()
 	a := &api.ApplicationSnapshot{LastUpdatedAt: &now, Observation: api.Observation{Reason: "Observed"}}
 	ref := api.ResourceReference{}
@@ -363,4 +366,42 @@ func (r *StatusReconciler) mapping(kind schema.GroupKind, versions ...string) (*
 		return r.Mapper.RESTMapping(kind, versions...)
 	}
 	return mapping, err
+}
+
+func (r *StatusReconciler) observeCleanup(ctx context.Context, cr *api.GitResource) (*api.ApplicationSnapshot, *api.ResourceSnapshot) {
+	now := metav1.Now()
+	a := &api.ApplicationSnapshot{LastUpdatedAt: &now, Observation: api.Observation{Reason: "Observed"}}
+	app := ApplicationObject()
+	ref := applicationRef(cr, r.SetKey.Namespace)
+	err := r.Reader.Get(ctx, client.ObjectKey{Namespace: ref.Namespace, Name: ref.Name}, app)
+	if err != nil {
+		a.Observation = observationError(err)
+	} else if cr.Status.Cleanup.ApplicationUID != "" && cr.Status.Cleanup.ApplicationUID != string(app.GetUID()) || app.GetAnnotations()[UIDAnnotation] != "" && app.GetAnnotations()[UIDAnnotation] != string(cr.UID) {
+		a.Observation = api.Observation{Reason: "IdentityConflict", Message: "A replacement Application occupies the cleanup identity."}
+	} else {
+		a.UID, a.ResourceVersion, a.DeletionTimestamp = string(app.GetUID()), app.GetResourceVersion(), app.GetDeletionTimestamp()
+		generation := app.GetGeneration()
+		a.Generation = &generation
+		spec, _ := app.Object["spec"].(map[string]interface{})
+		a.Source, err = copyObjectField(spec, "source")
+		if err == nil {
+			a.Destination, err = copyObjectField(spec, "destination")
+		}
+		if err == nil {
+			a.Status, err = copyObjectField(app.Object, "status")
+		}
+		if err != nil {
+			a.Observation = api.Observation{Reason: "InvalidStatus", Message: err.Error()}
+		}
+	}
+	target := cr.Status.Cleanup.ResourceRef
+	if target == nil {
+		target = cr.Status.PublishedResourceRef
+	}
+	if target == nil {
+		return a, &api.ResourceSnapshot{Observation: api.Observation{Reason: "NotTracked", Message: "No published cleanup reference is available."}}
+	}
+	resource := observeExact(ctx, r.Reader, r.Mapper, *target, cr.Namespace)
+	resource.ObservedAgainstRevision = cr.Status.LastPublishedRevision
+	return a, resource
 }
